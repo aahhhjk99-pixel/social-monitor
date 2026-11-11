@@ -9,7 +9,8 @@ import {
   Play,
   Plus,
   Users,
-  Trash2
+  Trash2,
+  RefreshCw
 } from "lucide-react";
 
 import { useAuth } from "../auth/AuthContext";
@@ -26,6 +27,20 @@ import type { GroupRecord } from "../types";
 
 const WRITE_TIMEOUT_MS = 20000;
 const REFRESH_TIMEOUT_MS = 12000;
+
+type SaveResult =
+  | { ok: true }
+  | { ok: false; error: unknown };
+
+type PendingSave = {
+  id: string;
+  ownerId: string;
+  name: string;
+  url: string;
+  result: Promise<SaveResult>;
+};
+
+type PendingSaveView = Omit<PendingSave, "result">;
 
 function withTimeout<T>(
   promise: Promise<T>,
@@ -50,337 +65,463 @@ function withTimeout<T>(
   });
 }
 
-function getErrorDetails(error: unknown): {
-  code: string;
-  message: string;
-} {
-  if (error && typeof error === "object") {
-    const item = error as {
-      code?: unknown;
-      message?: unknown;
-    };
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    const message = error.message || "";
 
-    return {
-      code: item.code ? String(item.code) : "",
-      message: item.message
-        ? String(item.message)
-        : "لا توجد تفاصيل إضافية."
-    };
-  }
+    if (
+      message.includes("42501") ||
+      message.toLowerCase().includes("permission denied") ||
+      message.toLowerCase().includes("row-level security")
+    ) {
+      return "ليست لديك صلاحية لتنفيذ العملية. تحقق من سياسات RLS في Supabase.";
+    }
 
-  return {
-    code: "",
-    message: error instanceof Error
-      ? error.message
-      : String(error)
-  };
-}
+    if (
+      message.includes("23505") ||
+      message.toLowerCase().includes("duplicate key")
+    ) {
+      return "هذه البيانات موجودة بالفعل.";
+    }
 
-function getErrorMessage(
-  error: unknown,
-  fallback: string
-): string {
-  const { code, message } = getErrorDetails(error);
+    if (
+      message.includes("23503") ||
+      message.toLowerCase().includes("foreign key")
+    ) {
+      return "تعذر تنفيذ العملية بسبب وجود بيانات مرتبطة بهذا السجل.";
+    }
 
-  if (code.includes("permission-denied")) {
-    return "Firebase رفض العملية بسبب صلاحيات قاعدة البيانات.";
+    if (
+      message.toLowerCase().includes("failed to fetch") ||
+      message.toLowerCase().includes("network")
+    ) {
+      return "تعذر الاتصال بـ Supabase. تحقق من الإنترنت وحاول مرة أخرى.";
+    }
+
+    return message;
   }
 
   if (
-    code.includes("unavailable") ||
-    code.includes("deadline-exceeded")
+    error &&
+    typeof error === "object" &&
+    "message" in error
   ) {
-    return "تعذر الاتصال بـ Firebase أو انتهت مهلة الاتصال.";
+    return String(error.message);
   }
 
-  if (code.includes("failed-precondition")) {
-    return "العملية تحتاج إعداداً إضافياً في Firestore.";
-  }
-
-  if (code.includes("unauthenticated")) {
-    return "انتهت جلسة تسجيل الدخول أو لم يتم التعرف على الحساب.";
-  }
-
-  if (code.includes("already-exists")) {
-    return "المستند موجود مسبقاً في قاعدة البيانات.";
-  }
-
-  if (code.includes("not-found")) {
-    return "المستند المطلوب غير موجود.";
-  }
-
-  return message || fallback;
+  return "حدث خطأ غير متوقع. حاول مرة أخرى.";
 }
 
-function errorText(error: unknown): string {
-  const details = getErrorDetails(error);
+function formatDate(timestamp: number): string {
+  const date = new Date(timestamp);
 
-  return [
-    getErrorMessage(error, "تعذر إتمام العملية."),
-    details.code
-      ? `رمز Firebase: ${details.code}`
-      : "لم يُرجع Firebase رمز خطأ.",
-    `التفاصيل: ${details.message}`
-  ].join("\n");
+  if (Number.isNaN(date.getTime())) {
+    return "تاريخ غير متوفر";
+  }
+
+  return date.toLocaleDateString("ar-LY", {
+    year: "numeric",
+    month: "short",
+    day: "numeric"
+  });
+}
+
+function validateGroupUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+
+    return (
+      url.protocol === "https:" ||
+      url.protocol === "http:"
+    );
+  } catch {
+    return false;
+  }
 }
 
 export default function Groups() {
   const { user } = useAuth();
 
   const [groups, setGroups] = useState<GroupRecord[]>([]);
+
   const [name, setName] = useState("");
   const [url, setUrl] = useState("");
+
   const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+
+  const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
 
-  const pendingGroupId = useRef<string | null>(null);
-  const submitting = useRef(false);
-  const mounted = useRef(true);
+  const [pendingSave, setPendingSave] =
+    useState<PendingSaveView | null>(null);
 
-  async function refresh(): Promise<GroupRecord[]> {
-    if (!user) return [];
+  const [rowBusyId, setRowBusyId] =
+    useState<string | null>(null);
+
+  const pendingSaveRef = useRef<PendingSave | null>(null);
+  const submittingRef = useRef(false);
+
+  // ---------------------------------
+  // تحميل المجموعات
+  // ---------------------------------
+
+  async function refreshGroups(): Promise<GroupRecord[]> {
+    if (!user?.uid) {
+      setGroups([]);
+      return [];
+    }
 
     const result = await listGroups(user.uid);
 
-    if (mounted.current) {
-      setGroups(result);
-    }
+    setGroups(result);
 
     return result;
   }
 
   useEffect(() => {
-    mounted.current = true;
-
-    return () => {
-      mounted.current = false;
-    };
-  }, []);
-
-  useEffect(() => {
     let active = true;
 
-    if (user) {
-      listGroups(user.uid)
-        .then((result) => {
-          if (active) {
-            setGroups(result);
-          }
-        })
-        .catch((err) => {
-          console.error("[Firestore groups] Loading failed:", err);
+    async function load() {
+      if (!user?.uid) {
+        setGroups([]);
+        setLoading(false);
+        return;
+      }
 
-          if (active) {
-            setError(
-              "تعذر تحميل المجموعات.\n" + errorText(err)
-            );
-          }
-        });
-    } else {
-      setGroups([]);
+      setLoading(true);
+      setError("");
+
+      try {
+        const result = await listGroups(user.uid);
+
+        if (active) {
+          setGroups(result);
+        }
+      } catch (err) {
+        if (active) {
+          setError(
+            "تعذر تحميل المجموعات.\n" +
+            getErrorMessage(err)
+          );
+        }
+      } finally {
+        if (active) {
+          setLoading(false);
+        }
+      }
     }
+
+    void load();
 
     return () => {
       active = false;
     };
-  }, [user]);
+  }, [user?.uid]);
 
-  async function submit(e: FormEvent<HTMLFormElement>) {
-    e.preventDefault();
+  // ---------------------------------
+  // تجهيز عملية الحفظ
+  // ---------------------------------
 
-    if (!user || submitting.current) return;
+  function createPendingSave(
+    ownerId: string,
+    groupName: string,
+    groupUrl: string
+  ): PendingSave {
+    const id = newGroupId();
 
-    const cleanName = name.trim();
-    const cleanUrl = url.trim();
+    const result: Promise<SaveResult> = createGroup(
+      ownerId,
+      groupName,
+      groupUrl,
+      id
+    ).then(
+      () => ({ ok: true as const }),
+      (error) => ({ ok: false as const, error })
+    );
 
-    if (!cleanName || !cleanUrl) {
-      setError("اكتب اسم المجموعة والرابط.");
+    return {
+      id,
+      ownerId,
+      name: groupName,
+      url: groupUrl,
+      result
+    };
+  }
+
+  // ---------------------------------
+  // إتمام الحفظ أو متابعة طلب سابق
+  // ---------------------------------
+
+  async function finishPendingSave() {
+    if (!user?.uid || submittingRef.current) {
       return;
     }
 
-    submitting.current = true;
+    submittingRef.current = true;
     setBusy(true);
     setError("");
-
-    let groupId: string;
+    setSuccess("");
 
     try {
-      groupId = pendingGroupId.current ?? newGroupId();
-      pendingGroupId.current = groupId;
-    } catch (err) {
-      console.error("[Firestore groups] ID generation failed:", err);
-      setError("تعذر تجهيز معرّف المجموعة.\n" + errorText(err));
-      submitting.current = false;
-      setBusy(false);
-      return;
-    }
+      let pending = pendingSaveRef.current;
 
-    let timedOut = false;
-    let settled = false;
+      if (!pending) {
+        const cleanName = name.trim();
+        const cleanUrl = url.trim();
 
-    const savePromise = createGroup(
-      user.uid,
-      cleanName,
-      cleanUrl,
-      groupId
-    );
-
-    savePromise.then(
-      async () => {
-        settled = true;
-
-        if (timedOut && mounted.current) {
-          console.info("[Firestore groups] Late save success:", groupId);
-
-          setGroups((current) => [
-            {
-              id: groupId,
-              ownerId: user.uid,
-              name: cleanName,
-              url: cleanUrl,
-              status: "unverified",
-              createdAt: Date.now()
-            },
-            ...current.filter((group) => group.id !== groupId)
-          ]);
-
-          pendingGroupId.current = null;
-          setName("");
-          setUrl("");
-
-          setError(
-            "تأكيد متأخر من Firebase: تم حفظ المجموعة بنجاح بعد انتهاء المهلة."
-          );
-
-          try {
-            await refresh();
-          } catch (refreshError) {
-            console.error("[Firestore groups] Late refresh failed:", refreshError);
-            setError(
-              "تم تأكيد حفظ المجموعة، لكن تحديث القائمة فشل.\n" +
-              errorText(refreshError)
-            );
-          }
+        if (!cleanName) {
+          setError("اكتب اسم المجموعة.");
+          return;
         }
-      },
-      (err) => {
-        settled = true;
 
-        if (timedOut && mounted.current) {
-          console.error("[Firestore groups] Late save failure:", err);
-
-          setError(
-            "وصل رد Firebase متأخراً، وفشلت عملية الحفظ فعلياً.\n" +
-            errorText(err)
-          );
+        if (!cleanUrl) {
+          setError("اكتب رابط المجموعة.");
+          return;
         }
+
+        if (!validateGroupUrl(cleanUrl)) {
+          setError("رابط المجموعة غير صحيح.");
+          return;
+        }
+
+        pending = createPendingSave(
+          user.uid,
+          cleanName,
+          cleanUrl
+        );
+
+        pendingSaveRef.current = pending;
+
+        setPendingSave({
+          id: pending.id,
+          ownerId: pending.ownerId,
+          name: pending.name,
+          url: pending.url
+        });
       }
-    );
 
-    try {
-      await withTimeout(
-        savePromise,
+      const result = await withTimeout(
+        pending.result,
         WRITE_TIMEOUT_MS,
-        "انتهت مهلة الانتظار بعد 20 ثانية. طلب الحفظ ما زال قيد الانتظار."
+        "انتهت مهلة الانتظار بعد 20 ثانية. لم يصل تأكيد الحفظ بعد."
       );
 
-      settled = true;
+      // فشل الحفظ
+      if (!result.ok) {
+        if (pendingSaveRef.current?.id === pending.id) {
+          pendingSaveRef.current = null;
+          setPendingSave(null);
+        }
 
+        setError(
+          "تعذر حفظ المجموعة.\n" +
+          getErrorMessage(result.error)
+        );
+
+        return;
+      }
+
+      // تأكد أن العملية ما زالت تخص الطلب الحالي
+      if (pendingSaveRef.current?.id !== pending.id) {
+        return;
+      }
+
+      // إضافة المجموعة محلياً
       const savedGroup: GroupRecord = {
-        id: groupId,
-        ownerId: user.uid,
-        name: cleanName,
-        url: cleanUrl,
+        id: pending.id,
+        ownerId: pending.ownerId,
+        name: pending.name,
+        url: pending.url,
         status: "unverified",
         createdAt: Date.now()
       };
 
       setGroups((current) => [
         savedGroup,
-        ...current.filter((group) => group.id !== groupId)
+        ...current.filter(
+          (group) => group.id !== pending.id
+        )
       ]);
 
-      pendingGroupId.current = null;
+      pendingSaveRef.current = null;
+      setPendingSave(null);
+
       setName("");
       setUrl("");
 
+      setSuccess("تم حفظ المجموعة بنجاح.");
+
+      // تحديث القائمة من قاعدة البيانات
       try {
         await withTimeout(
-          refresh(),
+          refreshGroups(),
           REFRESH_TIMEOUT_MS,
-          "تم تأكيد الحفظ، لكن تحديث القائمة تأخر."
+          "تم الحفظ، لكن تحديث القائمة تأخر."
         );
       } catch (refreshError) {
-        console.error("[Firestore groups] Refresh failed:", refreshError);
-
         setError(
           "تم حفظ المجموعة بنجاح، لكن تعذر تحديث القائمة.\n" +
-          errorText(refreshError)
+          getErrorMessage(refreshError)
         );
       }
-    } catch (writeError) {
-      timedOut =
-        writeError instanceof Error &&
-        writeError.message.includes("انتهت مهلة الانتظار");
+    } catch (err) {
+      const message = getErrorMessage(err);
 
-      console.error("[Firestore groups] Save failed or timed out:", writeError);
-
-      if (timedOut && !settled) {
+      // لا نحذف الطلب المعلق عند انتهاء المهلة
+      // حتى نتمكن من متابعة نفس العملية دون إنشاء طلب جديد
+      if (
+        message.includes("مهلة الانتظار")
+      ) {
         setError(
-          "انتهت مهلة الانتظار بعد 20 ثانية.\n" +
-          "طلب الحفظ ما زال قيد الانتظار. لن نكرر الطلب تلقائياً حتى لا تتكرر البيانات.\n" +
-          "سنظهر نتيجة Firebase هنا فور وصولها."
+          "انتهت مهلة الانتظار. لم يصل تأكيد Supabase بعد.\n" +
+          "بيانات المجموعة محفوظة مؤقتاً في النموذج. اضغط متابعة تأكيد الحفظ، ولن ننشئ طلباً جديداً."
         );
       } else {
-        setError(errorText(writeError));
+        setError(message);
       }
     } finally {
-      submitting.current = false;
+      submittingRef.current = false;
       setBusy(false);
     }
   }
 
+  // ---------------------------------
+  // إرسال النموذج
+  // ---------------------------------
+
+  async function submit(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+
+    await finishPendingSave();
+  }
+
+  // ---------------------------------
+  // تغيير حالة المجموعة
+  // ---------------------------------
+
   async function toggle(group: GroupRecord) {
+    if (rowBusyId || busy) return;
+
     setError("");
+    setSuccess("");
+
+    setRowBusyId(group.id);
+
+    const nextStatus =
+      group.status === "active"
+        ? "paused"
+        : "active";
 
     try {
-      const nextStatus =
-        group.status === "active" ? "paused" : "unverified";
+      await setGroupStatus(
+        group.id,
+        nextStatus
+      );
 
-      await setGroupStatus(group.id, nextStatus);
-      await refresh();
+      setGroups((current) =>
+        current.map((item) =>
+          item.id === group.id
+            ? { ...item, status: nextStatus }
+            : item
+        )
+      );
+
+      setSuccess(
+        nextStatus === "active"
+          ? "تم تفعيل المجموعة."
+          : "تم إيقاف المجموعة."
+      );
     } catch (err) {
-      console.error("[Firestore groups] Status update failed:", err);
-      setError("تعذر تحديث الحالة.\n" + errorText(err));
+      setError(
+        "تعذر تغيير حالة المجموعة.\n" +
+        getErrorMessage(err)
+      );
+    } finally {
+      setRowBusyId(null);
     }
   }
 
+  // ---------------------------------
+  // حذف المجموعة
+  // ---------------------------------
+
   async function remove(group: GroupRecord) {
-    if (!window.confirm("هل تريد حذف المجموعة؟")) return;
+    if (rowBusyId || busy) return;
+
+    const confirmed = window.confirm(
+      `هل أنت متأكد من حذف المجموعة "${group.name}"؟`
+    );
+
+    if (!confirmed) return;
 
     setError("");
+    setSuccess("");
+
+    setRowBusyId(group.id);
 
     try {
       await removeGroup(group.id);
 
       setGroups((current) =>
-        current.filter((item) => item.id !== group.id)
+        current.filter(
+          (item) => item.id !== group.id
+        )
       );
 
-      await refresh();
+      setSuccess("تم حذف المجموعة بنجاح.");
     } catch (err) {
-      console.error("[Firestore groups] Delete failed:", err);
-      setError("تعذر حذف المجموعة.\n" + errorText(err));
+      setError(
+        "تعذر حذف المجموعة.\n" +
+        getErrorMessage(err)
+      );
+    } finally {
+      setRowBusyId(null);
     }
   }
+
+  // ---------------------------------
+  // تحديث يدوي
+  // ---------------------------------
+
+  async function handleRefresh() {
+    if (loading || busy || rowBusyId) return;
+
+    setError("");
+    setSuccess("");
+
+    setLoading(true);
+
+    try {
+      await refreshGroups();
+      setSuccess("تم تحديث قائمة المجموعات.");
+    } catch (err) {
+      setError(
+        "تعذر تحديث المجموعات.\n" +
+        getErrorMessage(err)
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // ---------------------------------
+  // واجهة الصفحة
+  // ---------------------------------
 
   return (
     <div>
       <div className="page-heading">
         <div>
-          <span className="eyebrow">إدارة المصادر</span>
+          <span className="eyebrow">
+            إدارة المصادر
+          </span>
+
           <h1>المجموعات</h1>
-          <p>أضف مجموعاتك ونظّم إعدادات كل مجموعة بشكل مستقل.</p>
+
+          <p>
+            أضف مجموعاتك ونظّم إعدادات كل مجموعة بشكل مستقل.
+          </p>
         </div>
 
         <span className="count-pill">
@@ -398,12 +539,27 @@ export default function Groups() {
         </div>
       )}
 
-      <form className="panel add-form" onSubmit={submit}>
+      {success && (
+        <div
+          className="notice warning"
+          role="status"
+        >
+          {success}
+        </div>
+      )}
+
+      {/* إضافة مجموعة */}
+
+      <form
+        className="panel add-form"
+        onSubmit={submit}
+      >
         <div className="panel-head">
           <div>
             <h2>إضافة مجموعة</h2>
+
             <p>
-              أدخل الاسم والرابط. الإضافة لا تعني التحقق من إمكانية الوصول للمحتوى.
+              أدخل اسم المجموعة ورابطها لإضافتها إلى حسابك.
             </p>
           </div>
 
@@ -419,7 +575,7 @@ export default function Groups() {
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="مثال: أخبار وخدمات ليبيا"
-              disabled={busy}
+              disabled={busy || Boolean(pendingSave)}
             />
           </label>
 
@@ -432,7 +588,7 @@ export default function Groups() {
               value={url}
               onChange={(e) => setUrl(e.target.value)}
               placeholder="https://www.facebook.com/groups/..."
-              disabled={busy}
+              disabled={busy || Boolean(pendingSave)}
             />
           </label>
         </div>
@@ -440,95 +596,148 @@ export default function Groups() {
         <button
           className="primary-btn"
           disabled={busy || !user}
+          type="submit"
         >
-          <Plus size={16} />
-
-          {busy
-            ? "جارٍ الحفظ..."
-            : pendingGroupId.current
-              ? "إعادة محاولة الحفظ"
-              : "إضافة المجموعة"}
+          {busy ? (
+            <>
+              <RefreshCw size={16} />
+              جارٍ الحفظ...
+            </>
+          ) : pendingSave ? (
+            <>
+              <RefreshCw size={16} />
+              متابعة تأكيد الحفظ
+            </>
+          ) : (
+            <>
+              <Plus size={16} />
+              إضافة المجموعة
+            </>
+          )}
         </button>
       </form>
 
+      {/* قائمة المجموعات */}
+
       <div className="section-title">
         <h2>مجموعاتي</h2>
-        <span>{groups.length} نتيجة</span>
+
+        <div className="row-actions">
+          <span>{groups.length} نتيجة</span>
+
+          <button
+            className="icon-btn"
+            type="button"
+            title="تحديث القائمة"
+            onClick={() => void handleRefresh()}
+            disabled={loading || busy || Boolean(rowBusyId)}
+          >
+            <RefreshCw size={16} />
+          </button>
+        </div>
       </div>
 
-      {groups.length === 0 ? (
+      {loading ? (
+        <div className="panel empty-state">
+          <RefreshCw size={25} />
+          <b>جارٍ تحميل المجموعات...</b>
+          <p>ننتظر استجابة قاعدة البيانات.</p>
+        </div>
+      ) : groups.length === 0 ? (
         <div className="panel empty-state">
           <Users size={28} />
+
           <b>لم تضف أي مجموعة بعد</b>
-          <p>أضف رابط مجموعة لبدء تنظيم إعداداتها.</p>
+
+          <p>
+            أضف رابط مجموعة لبدء تنظيم إعداداتها.
+          </p>
         </div>
       ) : (
         <div className="groups-grid">
-          {groups.map((group) => (
-            <article className="group-card" key={group.id}>
-              <div className="group-card-top">
-                <div className="group-avatar">
-                  <Users />
+          {groups.map((group) => {
+            const rowBusy = rowBusyId === group.id;
+
+            return (
+              <article
+                className="group-card"
+                key={group.id}
+              >
+                <div className="group-card-top">
+                  <div className="group-avatar">
+                    <Users />
+                  </div>
+
+                  <span
+                    className={`status-pill ${group.status}`}
+                  >
+                    {group.status === "active"
+                      ? "مفعّلة"
+                      : group.status === "paused"
+                        ? "متوقفة"
+                        : "غير متحقق منها"}
+                  </span>
                 </div>
 
-                <span className={`status-pill ${group.status}`}>
-                  {group.status === "active"
-                    ? "مفعّلة"
-                    : group.status === "paused"
-                      ? "متوقفة"
-                      : "غير متحقق منها"}
-                </span>
-              </div>
+                <h3>{group.name}</h3>
 
-              <h3>{group.name}</h3>
+                <p className="group-url">
+                  {group.url}
+                </p>
 
-              <p className="group-url">{group.url}</p>
+                <div className="group-meta">
+                  أضيفت {formatDate(group.createdAt)}
+                </div>
 
-              <div className="group-meta">
-                أضيفت{" "}
-                {new Date(group.createdAt).toLocaleDateString("ar")}
-              </div>
+                <div className="card-actions">
+                  <Link
+                    className="secondary-btn"
+                    to={`/groups/${group.id}`}
+                  >
+                    فتح الصفحة
+                  </Link>
 
-              <div className="card-actions">
-                <Link
-                  className="secondary-btn"
-                  to={`/groups/${group.id}`}
-                >
-                  فتح الصفحة
-                </Link>
+                  <button
+                    className="icon-btn"
+                    title={
+                      group.status === "active"
+                        ? "إيقاف المجموعة"
+                        : "تفعيل المجموعة"
+                    }
+                    onClick={() => void toggle(group)}
+                    type="button"
+                    disabled={rowBusy || Boolean(rowBusyId) || busy}
+                  >
+                    {group.status === "active" ? (
+                      <Pause size={16} />
+                    ) : (
+                      <Play size={16} />
+                    )}
+                  </button>
 
-                <button
-                  className="icon-btn"
-                  title="تغيير الحالة"
-                  onClick={() => void toggle(group)}
-                  type="button"
-                >
-                  {group.status === "active"
-                    ? <Pause size={16} />
-                    : <Play size={16} />}
-                </button>
+                  <a
+                    className="icon-btn"
+                    href={group.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    title="فتح المجموعة الأصلية"
+                  >
+                    <ExternalLink size={16} />
+                  </a>
 
-                <a
-                  className="icon-btn"
-                  href={group.url}
-                  target="_blank"
-                  rel="noreferrer"
-                  title="فتح المجموعة"
-                >
-                  <ExternalLink size={16} />
-                </a>
-
-                <button
-                  className="icon-btn danger-icon"
-                  title="حذف"
-                  onClick={() => void remove(group)}
-                  type="button"
-                >
-                  <Trash2 size={16} />
-                </button>
-              </div>
-            </article>
-          ))}
+                  <button
+                    className="icon-btn danger-icon"
+                    title="حذف المجموعة"
+                    onClick={() => void remove(group)}
+                    type="button"
+                    disabled={rowBusy || Boolean(rowBusyId) || busy}
+                  >
+                    <Trash2 size={16} />
+                  </button>
+                </div>
+              </article>
+            );
+          })}
         </div>
       )}
     </div>
