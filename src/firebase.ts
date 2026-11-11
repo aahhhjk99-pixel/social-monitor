@@ -1,19 +1,18 @@
+
 import { initializeApp } from "firebase/app";
 import { getAuth } from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
 
-const config = {
-  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
-  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
-  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
-  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
-  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
-  appId: import.meta.env.VITE_FIREBASE_APP_ID,
+const firebaseConfig = {
+  apiKey: "AIzaSyCAy8-hZ5yNqEJ2CA7ZfRVKS4wPJUB9c44",
+  authDomain: "social-monitor-b981c.firebaseapp.com",
+  projectId: "social-monitor-b981c",
+  storageBucket: "social-monitor-b981c.firebasestorage.app",
+  messagingSenderId: "726708653101",
+  appId: "1:726708653101:web:0850433174c7998673fca4"
 };
 
-const configured = Boolean(config.apiKey && config.projectId && config.appId);
+const app = initializeApp(firebaseConfig);
 
-export const firebaseReady = configured;
-export const firebaseApp = configured ? initializeApp(config) : null;
-export const auth = firebaseApp ? getAuth(firebaseApp) : null;
-export const db = firebaseApp ? getFirestore(firebaseApp) : null;
+export const auth = getAuth(app);
+export const db = getFirestore(app);
