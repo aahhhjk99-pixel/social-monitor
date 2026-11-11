@@ -1,4 +1,3 @@
-
 import {
   createContext,
   useContext,
@@ -7,59 +6,109 @@ import {
 } from "react";
 
 import type { ReactNode } from "react";
+import type { User } from "@supabase/supabase-js";
 
-import {
-  onAuthStateChanged,
-  signInWithEmailAndPassword,
-  signOut,
-  createUserWithEmailAndPassword
-} from "firebase/auth";
+import { supabase, supabaseReady } from "../lib/supabase";
 
-import type { User } from "firebase/auth";
-
-import { auth } from "../firebase";
+export type AppUser = {
+  uid: string;
+  email: string | null;
+};
 
 type AuthValue = {
-  user: User | null;
+  user: AppUser | null;
   loading: boolean;
   signIn: (email: string, password: string) => Promise<void>;
-  register: (email: string, password: string) => Promise<void>;
+  register: (email: string, password: string) => Promise<boolean>;
   logout: () => Promise<void>;
 };
 
 const AuthContext = createContext<AuthValue | null>(null);
 
-export function AuthProvider({ children }: { children: ReactNode }) {
-  const [user, setUser] = useState<User | null>(null);
+function mapUser(user: User | null): AppUser | null {
+  if (!user) return null;
+
+  return {
+    uid: user.id,
+    email: user.email ?? null
+  };
+}
+
+function ensureConfigured() {
+  if (!supabaseReady) {
+    throw new Error(
+      "إعدادات Supabase غير مكتملة. تحقق من متغيرات البيئة."
+    );
+  }
+}
+
+export function AuthProvider({
+  children
+}: {
+  children: ReactNode;
+}) {
+  const [user, setUser] = useState<AppUser | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (nextUser) => {
-      setUser(nextUser);
+    let mounted = true;
+
+    if (!supabaseReady) {
+      setLoading(false);
+      return;
+    }
+
+    const {
+      data: { subscription }
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!mounted) return;
+
+      setUser(mapUser(session?.user ?? null));
       setLoading(false);
     });
 
-    return unsubscribe;
+    return () => {
+      mounted = false;
+      subscription.unsubscribe();
+    };
   }, []);
 
-  const signIn = async (email: string, password: string) => {
-    await signInWithEmailAndPassword(
-      auth,
-      email.trim(),
+  const signIn = async (
+    email: string,
+    password: string
+  ): Promise<void> => {
+    ensureConfigured();
+
+    const { error } = await supabase.auth.signInWithPassword({
+      email: email.trim().toLowerCase(),
       password
-    );
+    });
+
+    if (error) throw error;
   };
 
-  const register = async (email: string, password: string) => {
-    await createUserWithEmailAndPassword(
-      auth,
-      email.trim(),
+  const register = async (
+    email: string,
+    password: string
+  ): Promise<boolean> => {
+    ensureConfigured();
+
+    const { data, error } = await supabase.auth.signUp({
+      email: email.trim().toLowerCase(),
       password
-    );
+    });
+
+    if (error) throw error;
+
+    return Boolean(data.session);
   };
 
-  const logout = async () => {
-    await signOut(auth);
+  const logout = async (): Promise<void> => {
+    ensureConfigured();
+
+    const { error } = await supabase.auth.signOut();
+
+    if (error) throw error;
   };
 
   const value: AuthValue = {
