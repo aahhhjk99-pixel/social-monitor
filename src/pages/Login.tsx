@@ -1,11 +1,10 @@
-
 import { useState } from "react";
 import type { FormEvent } from "react";
 
 import { Activity, LockKeyhole } from "lucide-react";
 
 import { useAuth } from "../auth/AuthContext";
-import { firebaseReady } from "../firebase";
+import { supabaseReady } from "../lib/supabase";
 
 export default function Login() {
   const { signIn, register } = useAuth();
@@ -14,40 +13,63 @@ export default function Login() {
   const [password, setPassword] = useState("");
   const [mode, setMode] = useState<"login" | "register">("login");
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
 
   async function submit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
 
     setError("");
+    setNotice("");
     setBusy(true);
 
     try {
       if (mode === "login") {
         await signIn(email, password);
       } else {
-        await register(email, password);
+        const hasSession = await register(email, password);
+
+        if (hasSession) {
+          setNotice("تم إنشاء الحساب بنجاح.");
+        } else {
+          setNotice(
+            "تم إنشاء الحساب. تحقق من بريدك الإلكتروني لتأكيد التسجيل قبل تسجيل الدخول."
+          );
+        }
       }
     } catch (err: unknown) {
-      const code =
-        typeof err === "object" && err !== null && "code" in err
-          ? String(err.code)
+      const message =
+        err instanceof Error
+          ? err.message.toLowerCase()
           : "";
 
-      const messages: Record<string, string> = {
-        "auth/invalid-credential": "البريد الإلكتروني أو كلمة المرور غير صحيحة.",
-        "auth/user-not-found": "هذا الحساب غير موجود.",
-        "auth/wrong-password": "كلمة المرور غير صحيحة.",
-        "auth/email-already-in-use": "هذا البريد مستخدم بالفعل.",
-        "auth/weak-password": "كلمة المرور ضعيفة.",
-        "auth/invalid-email": "البريد الإلكتروني غير صحيح.",
-        "auth/network-request-failed": "تحقق من اتصال الإنترنت."
-      };
-
-      setError(
-        messages[code] ||
-        "تعذر إكمال العملية. حاول مرة أخرى."
-      );
+      if (
+        message.includes("invalid login credentials") ||
+        message.includes("invalid credentials")
+      ) {
+        setError("البريد الإلكتروني أو كلمة المرور غير صحيحة.");
+      } else if (message.includes("user already registered")) {
+        setError("هذا البريد الإلكتروني مسجل بالفعل.");
+      } else if (message.includes("password should be at least")) {
+        setError("كلمة المرور قصيرة جداً.");
+      } else if (message.includes("unable to validate email")) {
+        setError("البريد الإلكتروني غير صحيح.");
+      } else if (
+        message.includes("email not confirmed")
+      ) {
+        setError("يجب تأكيد البريد الإلكتروني أولاً.");
+      } else if (
+        message.includes("network") ||
+        message.includes("fetch")
+      ) {
+        setError("تعذر الاتصال. تحقق من الإنترنت وحاول مرة أخرى.");
+      } else {
+        setError(
+          err instanceof Error
+            ? err.message
+            : "تعذر إكمال العملية. حاول مرة أخرى."
+        );
+      }
     } finally {
       setBusy(false);
     }
@@ -63,14 +85,15 @@ export default function Login() {
         <h1>SOCIAL MONITOR</h1>
         <p>منصة مراقبة وتحليل المحتوى</p>
 
-        {!firebaseReady && (
+        {!supabaseReady && (
           <div className="notice warning">
-            Firebase غير مُعد بشكل صحيح.
+            إعدادات Supabase غير مكتملة. تحقق من متغيرات البيئة.
           </div>
         )}
 
         <label>
           البريد الإلكتروني
+
           <input
             type="email"
             required
@@ -83,6 +106,7 @@ export default function Login() {
 
         <label>
           كلمة المرور
+
           <input
             type="password"
             required
@@ -91,20 +115,28 @@ export default function Login() {
             onChange={(e) => setPassword(e.target.value)}
             placeholder="••••••••"
             autoComplete={
-              mode === "login" ? "current-password" : "new-password"
+              mode === "login"
+                ? "current-password"
+                : "new-password"
             }
           />
         </label>
 
         {error && (
-          <div className="notice error">
+          <div className="notice error" role="alert">
             {error}
+          </div>
+        )}
+
+        {notice && (
+          <div className="notice warning" role="status">
+            {notice}
           </div>
         )}
 
         <button
           className="primary-btn full"
-          disabled={busy || !firebaseReady}
+          disabled={busy || !supabaseReady}
           type="submit"
         >
           {busy
@@ -117,9 +149,13 @@ export default function Login() {
         <button
           type="button"
           className="text-btn"
+          disabled={busy}
           onClick={() => {
-            setMode(mode === "login" ? "register" : "login");
+            setMode(
+              mode === "login" ? "register" : "login"
+            );
             setError("");
+            setNotice("");
           }}
         >
           {mode === "login"
@@ -129,7 +165,7 @@ export default function Login() {
 
         <div className="secure-note">
           <LockKeyhole size={14} />
-          تسجيل الدخول محمي عبر Firebase Authentication
+          تسجيل الدخول محمي عبر Supabase Authentication
         </div>
       </form>
     </div>
