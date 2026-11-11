@@ -94,7 +94,7 @@ function getErrorMessage(
   }
 
   if (code.includes("failed-precondition")) {
-    return "العملية تحتاج إعداداً إضافياً في Firestore، وقد يكون السبب فهرساً غير جاهز.";
+    return "العملية تحتاج إعداداً إضافياً في Firestore.";
   }
 
   if (code.includes("unauthenticated")) {
@@ -112,6 +112,18 @@ function getErrorMessage(
   return message || fallback;
 }
 
+function errorText(error: unknown): string {
+  const details = getErrorDetails(error);
+
+  return [
+    getErrorMessage(error, "تعذر إتمام العملية."),
+    details.code
+      ? `رمز Firebase: ${details.code}`
+      : "لم يُرجع Firebase رمز خطأ.",
+    `التفاصيل: ${details.message}`
+  ].join("\n");
+}
+
 export default function Groups() {
   const { user } = useAuth();
 
@@ -123,15 +135,27 @@ export default function Groups() {
 
   const pendingGroupId = useRef<string | null>(null);
   const submitting = useRef(false);
+  const mounted = useRef(true);
 
   async function refresh(): Promise<GroupRecord[]> {
     if (!user) return [];
 
     const result = await listGroups(user.uid);
-    setGroups(result);
+
+    if (mounted.current) {
+      setGroups(result);
+    }
 
     return result;
   }
+
+  useEffect(() => {
+    mounted.current = true;
+
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -144,27 +168,11 @@ export default function Groups() {
           }
         })
         .catch((err) => {
-          console.error(
-            "[Firestore groups] loading failed:",
-            err
-          );
+          console.error("[Firestore groups] Loading failed:", err);
 
           if (active) {
-            const details = getErrorDetails(err);
-
             setError(
-              [
-                getErrorMessage(
-                  err,
-                  "تعذر تحميل المجموعات."
-                ),
-                details.code
-                  ? `رمز Firebase: ${details.code}`
-                  : "",
-                details.message
-              ]
-                .filter(Boolean)
-                .join("\n")
+              "تعذر تحميل المجموعات.\n" + errorText(err)
             );
           }
         });
@@ -177,9 +185,7 @@ export default function Groups() {
     };
   }, [user]);
 
-  async function submit(
-    e: FormEvent<HTMLFormElement>
-  ) {
+  async function submit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
 
     if (!user || submitting.current) return;
@@ -199,34 +205,18 @@ export default function Groups() {
     let groupId: string;
 
     try {
-      groupId =
-        pendingGroupId.current ?? newGroupId();
-
+      groupId = pendingGroupId.current ?? newGroupId();
       pendingGroupId.current = groupId;
     } catch (err) {
-      console.error(
-        "[Firestore groups] ID generation failed:",
-        err
-      );
-
-      const details = getErrorDetails(err);
-
-      setError(
-        [
-          "تعذر تجهيز معرّف المجموعة.",
-          details.code
-            ? `رمز Firebase: ${details.code}`
-            : "",
-          details.message
-        ]
-          .filter(Boolean)
-          .join("\n")
-      );
-
+      console.error("[Firestore groups] ID generation failed:", err);
+      setError("تعذر تجهيز معرّف المجموعة.\n" + errorText(err));
       submitting.current = false;
       setBusy(false);
       return;
     }
+
+    let timedOut = false;
+    let settled = false;
 
     const savePromise = createGroup(
       user.uid,
@@ -235,21 +225,53 @@ export default function Groups() {
       groupId
     );
 
-    let timedOut = false;
-
     savePromise.then(
-      () => {
-        if (timedOut) {
-          console.info(
-            "[Firestore groups] Save completed after timeout."
+      async () => {
+        settled = true;
+
+        if (timedOut && mounted.current) {
+          console.info("[Firestore groups] Late save success:", groupId);
+
+          setGroups((current) => [
+            {
+              id: groupId,
+              ownerId: user.uid,
+              name: cleanName,
+              url: cleanUrl,
+              status: "unverified",
+              createdAt: Date.now()
+            },
+            ...current.filter((group) => group.id !== groupId)
+          ]);
+
+          pendingGroupId.current = null;
+          setName("");
+          setUrl("");
+
+          setError(
+            "تأكيد متأخر من Firebase: تم حفظ المجموعة بنجاح بعد انتهاء المهلة."
           );
+
+          try {
+            await refresh();
+          } catch (refreshError) {
+            console.error("[Firestore groups] Late refresh failed:", refreshError);
+            setError(
+              "تم تأكيد حفظ المجموعة، لكن تحديث القائمة فشل.\n" +
+              errorText(refreshError)
+            );
+          }
         }
       },
       (err) => {
-        if (timedOut) {
-          console.error(
-            "[Firestore groups] Late save failure:",
-            err
+        settled = true;
+
+        if (timedOut && mounted.current) {
+          console.error("[Firestore groups] Late save failure:", err);
+
+          setError(
+            "وصل رد Firebase متأخراً، وفشلت عملية الحفظ فعلياً.\n" +
+            errorText(err)
           );
         }
       }
@@ -259,8 +281,10 @@ export default function Groups() {
       await withTimeout(
         savePromise,
         WRITE_TIMEOUT_MS,
-        "انتهت مهلة الانتظار بعد 20 ثانية. هذا لا يعني بالضرورة أن الحفظ فشل؛ نتيجة Firebase لم تصل في الوقت المحدد."
+        "انتهت مهلة الانتظار بعد 20 ثانية. طلب الحفظ ما زال قيد الانتظار."
       );
+
+      settled = true;
 
       const savedGroup: GroupRecord = {
         id: groupId,
@@ -273,9 +297,7 @@ export default function Groups() {
 
       setGroups((current) => [
         savedGroup,
-        ...current.filter(
-          (group) => group.id !== groupId
-        )
+        ...current.filter((group) => group.id !== groupId)
       ]);
 
       pendingGroupId.current = null;
@@ -286,56 +308,32 @@ export default function Groups() {
         await withTimeout(
           refresh(),
           REFRESH_TIMEOUT_MS,
-          "تم تأكيد حفظ المجموعة، لكن تحديث القائمة تأخر."
+          "تم تأكيد الحفظ، لكن تحديث القائمة تأخر."
         );
       } catch (refreshError) {
-        console.error(
-          "[Firestore groups] Refresh failed:",
-          refreshError
-        );
-
-        const details = getErrorDetails(refreshError);
+        console.error("[Firestore groups] Refresh failed:", refreshError);
 
         setError(
-          [
-            "تم حفظ المجموعة، لكن تعذر تحديث القائمة.",
-            details.code
-              ? `رمز Firebase: ${details.code}`
-              : "",
-            details.message
-          ]
-            .filter(Boolean)
-            .join("\n")
+          "تم حفظ المجموعة بنجاح، لكن تعذر تحديث القائمة.\n" +
+          errorText(refreshError)
         );
       }
     } catch (writeError) {
       timedOut =
         writeError instanceof Error &&
-        writeError.message.includes(
-          "انتهت مهلة الانتظار بعد 20 ثانية"
+        writeError.message.includes("انتهت مهلة الانتظار");
+
+      console.error("[Firestore groups] Save failed or timed out:", writeError);
+
+      if (timedOut && !settled) {
+        setError(
+          "انتهت مهلة الانتظار بعد 20 ثانية.\n" +
+          "طلب الحفظ ما زال قيد الانتظار. لن نكرر الطلب تلقائياً حتى لا تتكرر البيانات.\n" +
+          "سنظهر نتيجة Firebase هنا فور وصولها."
         );
-
-      console.error(
-        "[Firestore groups] Save failed or timed out:",
-        writeError
-      );
-
-      const details = getErrorDetails(writeError);
-
-      setError(
-        [
-          getErrorMessage(
-            writeError,
-            "تعذر تأكيد حفظ المجموعة."
-          ),
-          details.code
-            ? `رمز Firebase: ${details.code}`
-            : "",
-          details.message
-        ]
-          .filter(Boolean)
-          .join("\n")
-      );
+      } else {
+        setError(errorText(writeError));
+      }
     } finally {
       submitting.current = false;
       setBusy(false);
@@ -347,41 +345,18 @@ export default function Groups() {
 
     try {
       const nextStatus =
-        group.status === "active"
-          ? "paused"
-          : "unverified";
+        group.status === "active" ? "paused" : "unverified";
 
       await setGroupStatus(group.id, nextStatus);
       await refresh();
     } catch (err) {
-      console.error(
-        "[Firestore groups] Status update failed:",
-        err
-      );
-
-      const details = getErrorDetails(err);
-
-      setError(
-        [
-          getErrorMessage(
-            err,
-            "تعذر تحديث الحالة."
-          ),
-          details.code
-            ? `رمز Firebase: ${details.code}`
-            : "",
-          details.message
-        ]
-          .filter(Boolean)
-          .join("\n")
-      );
+      console.error("[Firestore groups] Status update failed:", err);
+      setError("تعذر تحديث الحالة.\n" + errorText(err));
     }
   }
 
   async function remove(group: GroupRecord) {
-    if (!window.confirm("هل تريد حذف المجموعة؟")) {
-      return;
-    }
+    if (!window.confirm("هل تريد حذف المجموعة؟")) return;
 
     setError("");
 
@@ -389,34 +364,13 @@ export default function Groups() {
       await removeGroup(group.id);
 
       setGroups((current) =>
-        current.filter(
-          (item) => item.id !== group.id
-        )
+        current.filter((item) => item.id !== group.id)
       );
 
       await refresh();
     } catch (err) {
-      console.error(
-        "[Firestore groups] Delete failed:",
-        err
-      );
-
-      const details = getErrorDetails(err);
-
-      setError(
-        [
-          getErrorMessage(
-            err,
-            "تعذر حذف المجموعة."
-          ),
-          details.code
-            ? `رمز Firebase: ${details.code}`
-            : "",
-          details.message
-        ]
-          .filter(Boolean)
-          .join("\n")
-      );
+      console.error("[Firestore groups] Delete failed:", err);
+      setError("تعذر حذف المجموعة.\n" + errorText(err));
     }
   }
 
@@ -424,15 +378,9 @@ export default function Groups() {
     <div>
       <div className="page-heading">
         <div>
-          <span className="eyebrow">
-            إدارة المصادر
-          </span>
-
+          <span className="eyebrow">إدارة المصادر</span>
           <h1>المجموعات</h1>
-
-          <p>
-            أضف مجموعاتك ونظّم إعدادات كل مجموعة بشكل مستقل.
-          </p>
+          <p>أضف مجموعاتك ونظّم إعدادات كل مجموعة بشكل مستقل.</p>
         </div>
 
         <span className="count-pill">
@@ -450,14 +398,10 @@ export default function Groups() {
         </div>
       )}
 
-      <form
-        className="panel add-form"
-        onSubmit={submit}
-      >
+      <form className="panel add-form" onSubmit={submit}>
         <div className="panel-head">
           <div>
             <h2>إضافة مجموعة</h2>
-
             <p>
               أدخل الاسم والرابط. الإضافة لا تعني التحقق من إمكانية الوصول للمحتوى.
             </p>
@@ -473,9 +417,7 @@ export default function Groups() {
             <input
               required
               value={name}
-              onChange={(e) =>
-                setName(e.target.value)
-              }
+              onChange={(e) => setName(e.target.value)}
               placeholder="مثال: أخبار وخدمات ليبيا"
               disabled={busy}
             />
@@ -488,9 +430,7 @@ export default function Groups() {
               required
               type="url"
               value={url}
-              onChange={(e) =>
-                setUrl(e.target.value)
-              }
+              onChange={(e) => setUrl(e.target.value)}
               placeholder="https://www.facebook.com/groups/..."
               disabled={busy}
             />
@@ -519,28 +459,19 @@ export default function Groups() {
       {groups.length === 0 ? (
         <div className="panel empty-state">
           <Users size={28} />
-
           <b>لم تضف أي مجموعة بعد</b>
-
-          <p>
-            أضف رابط مجموعة لبدء تنظيم إعداداتها.
-          </p>
+          <p>أضف رابط مجموعة لبدء تنظيم إعداداتها.</p>
         </div>
       ) : (
         <div className="groups-grid">
           {groups.map((group) => (
-            <article
-              className="group-card"
-              key={group.id}
-            >
+            <article className="group-card" key={group.id}>
               <div className="group-card-top">
                 <div className="group-avatar">
                   <Users />
                 </div>
 
-                <span
-                  className={`status-pill ${group.status}`}
-                >
+                <span className={`status-pill ${group.status}`}>
                   {group.status === "active"
                     ? "مفعّلة"
                     : group.status === "paused"
@@ -551,15 +482,11 @@ export default function Groups() {
 
               <h3>{group.name}</h3>
 
-              <p className="group-url">
-                {group.url}
-              </p>
+              <p className="group-url">{group.url}</p>
 
               <div className="group-meta">
                 أضيفت{" "}
-                {new Date(
-                  group.createdAt
-                ).toLocaleDateString("ar")}
+                {new Date(group.createdAt).toLocaleDateString("ar")}
               </div>
 
               <div className="card-actions">
@@ -573,9 +500,7 @@ export default function Groups() {
                 <button
                   className="icon-btn"
                   title="تغيير الحالة"
-                  onClick={() =>
-                    void toggle(group)
-                  }
+                  onClick={() => void toggle(group)}
                   type="button"
                 >
                   {group.status === "active"
@@ -596,9 +521,7 @@ export default function Groups() {
                 <button
                   className="icon-btn danger-icon"
                   title="حذف"
-                  onClick={() =>
-                    void remove(group)
-                  }
+                  onClick={() => void remove(group)}
                   type="button"
                 >
                   <Trash2 size={16} />
