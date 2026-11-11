@@ -50,34 +50,66 @@ function withTimeout<T>(
   });
 }
 
+function getErrorDetails(error: unknown): {
+  code: string;
+  message: string;
+} {
+  if (error && typeof error === "object") {
+    const item = error as {
+      code?: unknown;
+      message?: unknown;
+    };
+
+    return {
+      code: item.code ? String(item.code) : "",
+      message: item.message
+        ? String(item.message)
+        : "لا توجد تفاصيل إضافية."
+    };
+  }
+
+  return {
+    code: "",
+    message: error instanceof Error
+      ? error.message
+      : String(error)
+  };
+}
+
 function getErrorMessage(
   error: unknown,
   fallback: string
 ): string {
-  if (error && typeof error === "object" && "code" in error) {
-    const code = String(
-      (error as { code?: unknown }).code
-    );
+  const { code, message } = getErrorDetails(error);
 
-    if (code.includes("permission-denied")) {
-      return "Firebase رفض العملية بسبب صلاحيات قاعدة البيانات. راجع قواعد Firestore والحساب المسجل.";
-    }
-
-    if (
-      code.includes("unavailable") ||
-      code.includes("deadline-exceeded")
-    ) {
-      return "تعذر الاتصال بـ Firebase حالياً. تحقق من الإنترنت وحاول مرة أخرى.";
-    }
-
-    if (code.includes("failed-precondition")) {
-      return "الاستعلام يحتاج إعداداً في Firestore. تأكد أن الفهرس المطلوب أصبح Enabled.";
-    }
+  if (code.includes("permission-denied")) {
+    return "Firebase رفض العملية بسبب صلاحيات قاعدة البيانات.";
   }
 
-  return error instanceof Error
-    ? error.message
-    : fallback;
+  if (
+    code.includes("unavailable") ||
+    code.includes("deadline-exceeded")
+  ) {
+    return "تعذر الاتصال بـ Firebase أو انتهت مهلة الاتصال.";
+  }
+
+  if (code.includes("failed-precondition")) {
+    return "العملية تحتاج إعداداً إضافياً في Firestore، وقد يكون السبب فهرساً غير جاهز.";
+  }
+
+  if (code.includes("unauthenticated")) {
+    return "انتهت جلسة تسجيل الدخول أو لم يتم التعرف على الحساب.";
+  }
+
+  if (code.includes("already-exists")) {
+    return "المستند موجود مسبقاً في قاعدة البيانات.";
+  }
+
+  if (code.includes("not-found")) {
+    return "المستند المطلوب غير موجود.";
+  }
+
+  return message || fallback;
 }
 
 export default function Groups() {
@@ -107,15 +139,32 @@ export default function Groups() {
     if (user) {
       listGroups(user.uid)
         .then((result) => {
-          if (active) setGroups(result);
+          if (active) {
+            setGroups(result);
+          }
         })
         .catch((err) => {
+          console.error(
+            "[Firestore groups] loading failed:",
+            err
+          );
+
           if (active) {
+            const details = getErrorDetails(err);
+
             setError(
-              getErrorMessage(
-                err,
-                "تعذر تحميل المجموعات."
-              )
+              [
+                getErrorMessage(
+                  err,
+                  "تعذر تحميل المجموعات."
+                ),
+                details.code
+                  ? `رمز Firebase: ${details.code}`
+                  : "",
+                details.message
+              ]
+                .filter(Boolean)
+                .join("\n")
             );
           }
         });
@@ -147,21 +196,70 @@ export default function Groups() {
     setBusy(true);
     setError("");
 
-    const groupId =
-      pendingGroupId.current ?? newGroupId();
+    let groupId: string;
 
-    pendingGroupId.current = groupId;
+    try {
+      groupId =
+        pendingGroupId.current ?? newGroupId();
+
+      pendingGroupId.current = groupId;
+    } catch (err) {
+      console.error(
+        "[Firestore groups] ID generation failed:",
+        err
+      );
+
+      const details = getErrorDetails(err);
+
+      setError(
+        [
+          "تعذر تجهيز معرّف المجموعة.",
+          details.code
+            ? `رمز Firebase: ${details.code}`
+            : "",
+          details.message
+        ]
+          .filter(Boolean)
+          .join("\n")
+      );
+
+      submitting.current = false;
+      setBusy(false);
+      return;
+    }
+
+    const savePromise = createGroup(
+      user.uid,
+      cleanName,
+      cleanUrl,
+      groupId
+    );
+
+    let timedOut = false;
+
+    savePromise.then(
+      () => {
+        if (timedOut) {
+          console.info(
+            "[Firestore groups] Save completed after timeout."
+          );
+        }
+      },
+      (err) => {
+        if (timedOut) {
+          console.error(
+            "[Firestore groups] Late save failure:",
+            err
+          );
+        }
+      }
+    );
 
     try {
       await withTimeout(
-        createGroup(
-          user.uid,
-          cleanName,
-          cleanUrl,
-          groupId
-        ),
+        savePromise,
         WRITE_TIMEOUT_MS,
-        "تأخر رد Firebase أكثر من 20 ثانية. لم نكرر عملية الحفظ؛ اضغط إعادة المحاولة بنفس البيانات حتى نتأكد من النتيجة."
+        "انتهت مهلة الانتظار بعد 20 ثانية. هذا لا يعني بالضرورة أن الحفظ فشل؛ نتيجة Firebase لم تصل في الوقت المحدد."
       );
 
       const savedGroup: GroupRecord = {
@@ -188,22 +286,55 @@ export default function Groups() {
         await withTimeout(
           refresh(),
           REFRESH_TIMEOUT_MS,
-          "تم حفظ المجموعة، لكن تحديث القائمة تأخر. ستبقى المجموعة ظاهرة ويمكن تحديث الصفحة لاحقاً."
+          "تم تأكيد حفظ المجموعة، لكن تحديث القائمة تأخر."
         );
       } catch (refreshError) {
+        console.error(
+          "[Firestore groups] Refresh failed:",
+          refreshError
+        );
+
+        const details = getErrorDetails(refreshError);
+
         setError(
-          getErrorMessage(
-            refreshError,
-            "تم حفظ المجموعة، لكن تعذر تحديث القائمة. حدّث الصفحة بعد قليل."
-          )
+          [
+            "تم حفظ المجموعة، لكن تعذر تحديث القائمة.",
+            details.code
+              ? `رمز Firebase: ${details.code}`
+              : "",
+            details.message
+          ]
+            .filter(Boolean)
+            .join("\n")
         );
       }
     } catch (writeError) {
+      timedOut =
+        writeError instanceof Error &&
+        writeError.message.includes(
+          "انتهت مهلة الانتظار بعد 20 ثانية"
+        );
+
+      console.error(
+        "[Firestore groups] Save failed or timed out:",
+        writeError
+      );
+
+      const details = getErrorDetails(writeError);
+
       setError(
-        getErrorMessage(
-          writeError,
-          "تعذر تأكيد حفظ المجموعة. بيانات النموذج محفوظة لإعادة المحاولة."
-        )
+        [
+          getErrorMessage(
+            writeError,
+            "تعذر تأكيد حفظ المجموعة."
+          ),
+          details.code
+            ? `رمز Firebase: ${details.code}`
+            : "",
+          details.message
+        ]
+          .filter(Boolean)
+          .join("\n")
       );
     } finally {
       submitting.current = false;
@@ -223,8 +354,26 @@ export default function Groups() {
       await setGroupStatus(group.id, nextStatus);
       await refresh();
     } catch (err) {
+      console.error(
+        "[Firestore groups] Status update failed:",
+        err
+      );
+
+      const details = getErrorDetails(err);
+
       setError(
-        getErrorMessage(err, "تعذر تحديث الحالة.")
+        [
+          getErrorMessage(
+            err,
+            "تعذر تحديث الحالة."
+          ),
+          details.code
+            ? `رمز Firebase: ${details.code}`
+            : "",
+          details.message
+        ]
+          .filter(Boolean)
+          .join("\n")
       );
     }
   }
@@ -240,13 +389,33 @@ export default function Groups() {
       await removeGroup(group.id);
 
       setGroups((current) =>
-        current.filter((item) => item.id !== group.id)
+        current.filter(
+          (item) => item.id !== group.id
+        )
       );
 
       await refresh();
     } catch (err) {
+      console.error(
+        "[Firestore groups] Delete failed:",
+        err
+      );
+
+      const details = getErrorDetails(err);
+
       setError(
-        getErrorMessage(err, "تعذر حذف المجموعة.")
+        [
+          getErrorMessage(
+            err,
+            "تعذر حذف المجموعة."
+          ),
+          details.code
+            ? `رمز Firebase: ${details.code}`
+            : "",
+          details.message
+        ]
+          .filter(Boolean)
+          .join("\n")
       );
     }
   }
@@ -255,8 +424,12 @@ export default function Groups() {
     <div>
       <div className="page-heading">
         <div>
-          <span className="eyebrow">إدارة المصادر</span>
+          <span className="eyebrow">
+            إدارة المصادر
+          </span>
+
           <h1>المجموعات</h1>
+
           <p>
             أضف مجموعاتك ونظّم إعدادات كل مجموعة بشكل مستقل.
           </p>
@@ -268,7 +441,11 @@ export default function Groups() {
       </div>
 
       {error && (
-        <div className="notice error" role="alert">
+        <div
+          className="notice error"
+          role="alert"
+          style={{ whiteSpace: "pre-line" }}
+        >
           {error}
         </div>
       )}
@@ -280,6 +457,7 @@ export default function Groups() {
         <div className="panel-head">
           <div>
             <h2>إضافة مجموعة</h2>
+
             <p>
               أدخل الاسم والرابط. الإضافة لا تعني التحقق من إمكانية الوصول للمحتوى.
             </p>
@@ -295,7 +473,9 @@ export default function Groups() {
             <input
               required
               value={name}
-              onChange={(e) => setName(e.target.value)}
+              onChange={(e) =>
+                setName(e.target.value)
+              }
               placeholder="مثال: أخبار وخدمات ليبيا"
               disabled={busy}
             />
@@ -308,7 +488,9 @@ export default function Groups() {
               required
               type="url"
               value={url}
-              onChange={(e) => setUrl(e.target.value)}
+              onChange={(e) =>
+                setUrl(e.target.value)
+              }
               placeholder="https://www.facebook.com/groups/..."
               disabled={busy}
             />
@@ -337,7 +519,9 @@ export default function Groups() {
       {groups.length === 0 ? (
         <div className="panel empty-state">
           <Users size={28} />
+
           <b>لم تضف أي مجموعة بعد</b>
+
           <p>
             أضف رابط مجموعة لبدء تنظيم إعداداتها.
           </p>
@@ -366,7 +550,10 @@ export default function Groups() {
               </div>
 
               <h3>{group.name}</h3>
-              <p className="group-url">{group.url}</p>
+
+              <p className="group-url">
+                {group.url}
+              </p>
 
               <div className="group-meta">
                 أضيفت{" "}
@@ -386,7 +573,9 @@ export default function Groups() {
                 <button
                   className="icon-btn"
                   title="تغيير الحالة"
-                  onClick={() => void toggle(group)}
+                  onClick={() =>
+                    void toggle(group)
+                  }
                   type="button"
                 >
                   {group.status === "active"
@@ -407,7 +596,9 @@ export default function Groups() {
                 <button
                   className="icon-btn danger-icon"
                   title="حذف"
-                  onClick={() => void remove(group)}
+                  onClick={() =>
+                    void remove(group)
+                  }
                   type="button"
                 >
                   <Trash2 size={16} />
