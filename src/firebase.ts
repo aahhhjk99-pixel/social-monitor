@@ -12,7 +12,15 @@ const firebaseConfig = {
   appId: "1:726708653101:web:0850433174c7998673fca4"
 };
 
+export const firebaseReady = Boolean(
+  firebaseConfig.apiKey &&
+  firebaseConfig.authDomain &&
+  firebaseConfig.projectId &&
+  firebaseConfig.appId
+);
+
 const app = initializeApp(firebaseConfig);
 
 export const auth = getAuth(app);
 export const db = getFirestore(app);
+export default app;
