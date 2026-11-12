@@ -5,7 +5,6 @@ on:
   push:
     branches:
       - main
-
   workflow_dispatch:
 
 permissions:
@@ -37,15 +36,17 @@ jobs:
 
       - name: Build Vite application
         run: npm run build
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY }}
 
-      - name: Fix React Router routes on GitHub Pages
+      - name: Fix React Router routes
         run: cp dist/index.html dist/404.html
 
-      - name: Verify deployment files
+      - name: Verify build
         run: |
           test -f dist/index.html
           test -f dist/404.html
-          echo "Build files verified successfully."
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
