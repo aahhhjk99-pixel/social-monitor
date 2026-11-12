@@ -1,3 +1,4 @@
+
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
@@ -10,16 +11,12 @@ import "./styles.css";
 const rootElement = document.getElementById("root");
 
 if (!rootElement) {
-  throw new Error(
-    'لم يتم العثور على العنصر #root في ملف index.html'
-  );
+  throw new Error("لم يتم العثور على العنصر #root في ملف index.html");
 }
 
-const root = ReactDOM.createRoot(rootElement);
-
-root.render(
+ReactDOM.createRoot(rootElement).render(
   <React.StrictMode>
-    <BrowserRouter>
+    <BrowserRouter basename="/social-monitor">
       <AuthProvider>
         <App />
       </AuthProvider>
