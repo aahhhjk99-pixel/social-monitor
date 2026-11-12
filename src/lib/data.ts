@@ -1,3 +1,4 @@
+
 import { supabase } from "./supabase";
 
 import type {
@@ -8,14 +9,22 @@ import type {
 
 type DbRow = Record<string, unknown>;
 
-function handleError(error: { message?: string; code?: string } | null) {
+type SupabaseError = {
+  message?: string;
+  code?: string;
+};
+
+function handleError(error: SupabaseError | null): void {
   if (!error) return;
 
   const message = error.message || "حدث خطأ غير معروف.";
 
-  if (error.code === "42501" || error.code === "PGRST301") {
+  if (
+    error.code === "42501" ||
+    error.code === "PGRST301"
+  ) {
     throw new Error(
-      "ليس لديك صلاحية لتنفيذ هذه العملية. تحقق من إعدادات RLS."
+      "ليس لديك صلاحية لتنفيذ هذه العملية. تحقق من إعدادات RLS في Supabase."
     );
   }
 
@@ -29,6 +38,10 @@ function handleError(error: { message?: string; code?: string } | null) {
     );
   }
 
+  if (error.code === "22P02") {
+    throw new Error("صيغة إحدى البيانات غير صحيحة.");
+  }
+
   throw new Error(message);
 }
 
@@ -37,6 +50,7 @@ function timestampToNumber(value: unknown): number {
 
   if (typeof value === "string") {
     const parsed = Date.parse(value);
+
     return Number.isNaN(parsed) ? Date.now() : parsed;
   }
 
@@ -117,9 +131,51 @@ function mapMention(row: DbRow): MentionRecord {
   };
 }
 
-// -----------------------------
+// ---------------------------------
+// VALIDATION
+// ---------------------------------
+
+function validateGroupInput(
+  name: string,
+  url: string
+): { name: string; url: string } {
+  const cleanName = name.trim();
+  const cleanUrl = url.trim();
+
+  if (!cleanName) {
+    throw new Error("اكتب اسم المجموعة.");
+  }
+
+  if (cleanName.length > 150) {
+    throw new Error("اسم المجموعة طويل جداً.");
+  }
+
+  if (!cleanUrl) {
+    throw new Error("اكتب رابط المجموعة.");
+  }
+
+  try {
+    const parsed = new URL(cleanUrl);
+
+    if (
+      parsed.protocol !== "https:" &&
+      parsed.protocol !== "http:"
+    ) {
+      throw new Error();
+    }
+  } catch {
+    throw new Error("رابط المجموعة غير صحيح.");
+  }
+
+  return {
+    name: cleanName,
+    url: cleanUrl
+  };
+}
+
+// ---------------------------------
 // GROUPS
-// -----------------------------
+// ---------------------------------
 
 export async function listGroups(
   ownerId: string
@@ -134,7 +190,9 @@ export async function listGroups(
 
   handleError(error);
 
-  return (data ?? []).map((row) => mapGroup(row as DbRow));
+  return (data ?? []).map((row) =>
+    mapGroup(row as DbRow)
+  );
 }
 
 export function newGroupId(): string {
@@ -147,26 +205,15 @@ export async function createGroup(
   url: string,
   groupId: string
 ): Promise<void> {
-  const cleanName = name.trim();
-  const cleanUrl = url.trim();
-
   if (!ownerId) {
     throw new Error("الحساب غير مسجل الدخول.");
   }
 
-  if (!cleanName) {
-    throw new Error("اكتب اسم المجموعة.");
+  if (!groupId) {
+    throw new Error("معرّف المجموعة غير صحيح.");
   }
 
-  if (!cleanUrl) {
-    throw new Error("اكتب رابط المجموعة.");
-  }
-
-  try {
-    new URL(cleanUrl);
-  } catch {
-    throw new Error("رابط المجموعة غير صحيح.");
-  }
+  const clean = validateGroupInput(name, url);
 
   const { error } = await supabase
     .from("groups")
@@ -174,8 +221,8 @@ export async function createGroup(
       {
         id: groupId,
         owner_id: ownerId,
-        name: cleanName,
-        url: cleanUrl,
+        name: clean.name,
+        url: clean.url,
         status: "unverified"
       },
       {
@@ -186,10 +233,56 @@ export async function createGroup(
   handleError(error);
 }
 
+// تعديل اسم ورابط المجموعة
+export async function updateGroup(
+  id: string,
+  ownerId: string,
+  name: string,
+  url: string
+): Promise<void> {
+  if (!id || !ownerId) {
+    throw new Error("بيانات المجموعة أو الحساب غير صحيحة.");
+  }
+
+  const clean = validateGroupInput(name, url);
+
+  const { data, error } = await supabase
+    .from("groups")
+    .update({
+      name: clean.name,
+      url: clean.url
+    })
+    .eq("id", id)
+    .eq("owner_id", ownerId)
+    .select("id")
+    .maybeSingle();
+
+  handleError(error);
+
+  if (!data) {
+    throw new Error(
+      "لم يتم تعديل المجموعة. ربما لا تملك صلاحية تعديلها."
+    );
+  }
+}
+
+// تغيير حالة المجموعة
 export async function setGroupStatus(
   id: string,
   status: GroupRecord["status"]
 ): Promise<void> {
+  if (!id) {
+    throw new Error("معرّف المجموعة غير صحيح.");
+  }
+
+  if (
+    status !== "active" &&
+    status !== "paused" &&
+    status !== "unverified"
+  ) {
+    throw new Error("حالة المجموعة غير صحيحة.");
+  }
+
   const { data, error } = await supabase
     .from("groups")
     .update({ status })
@@ -206,7 +299,14 @@ export async function setGroupStatus(
   }
 }
 
-export async function removeGroup(id: string): Promise<void> {
+// حذف المجموعة
+export async function removeGroup(
+  id: string
+): Promise<void> {
+  if (!id) {
+    throw new Error("معرّف المجموعة غير صحيح.");
+  }
+
   const { data, error } = await supabase
     .from("groups")
     .delete()
@@ -222,9 +322,9 @@ export async function removeGroup(id: string): Promise<void> {
   }
 }
 
-// -----------------------------
+// ---------------------------------
 // KEYWORDS
-// -----------------------------
+// ---------------------------------
 
 export async function listKeywords(
   ownerId: string
@@ -239,7 +339,9 @@ export async function listKeywords(
 
   handleError(error);
 
-  return (data ?? []).map((row) => mapKeyword(row as DbRow));
+  return (data ?? []).map((row) =>
+    mapKeyword(row as DbRow)
+  );
 }
 
 export async function createKeyword(
@@ -247,11 +349,11 @@ export async function createKeyword(
   term: string,
   groupId: string | "all"
 ): Promise<void> {
-  const cleanTerm = term.trim();
-
   if (!ownerId) {
     throw new Error("الحساب غير مسجل الدخول.");
   }
+
+  const cleanTerm = term.trim();
 
   if (!cleanTerm) {
     throw new Error("اكتب الكلمة المفتاحية.");
@@ -274,10 +376,20 @@ export async function updateKeyword(
   id: string,
   changes: Partial<KeywordRecord>
 ): Promise<void> {
+  if (!id) {
+    throw new Error("معرّف الكلمة المفتاحية غير صحيح.");
+  }
+
   const update: Record<string, unknown> = {};
 
   if (typeof changes.term === "string") {
-    update.keyword = changes.term.trim();
+    const cleanTerm = changes.term.trim();
+
+    if (!cleanTerm) {
+      throw new Error("اكتب الكلمة المفتاحية.");
+    }
+
+    update.keyword = cleanTerm;
   }
 
   if (typeof changes.enabled === "boolean") {
@@ -290,7 +402,9 @@ export async function updateKeyword(
 
   if (typeof changes.groupId === "string") {
     update.group_id =
-      changes.groupId === "all" ? null : changes.groupId;
+      changes.groupId === "all"
+        ? null
+        : changes.groupId;
   }
 
   if (Object.keys(update).length === 0) return;
@@ -311,7 +425,13 @@ export async function updateKeyword(
   }
 }
 
-export async function removeKeyword(id: string): Promise<void> {
+export async function removeKeyword(
+  id: string
+): Promise<void> {
+  if (!id) {
+    throw new Error("معرّف الكلمة المفتاحية غير صحيح.");
+  }
+
   const { data, error } = await supabase
     .from("keywords")
     .delete()
@@ -327,9 +447,9 @@ export async function removeKeyword(id: string): Promise<void> {
   }
 }
 
-// -----------------------------
+// ---------------------------------
 // MENTIONS
-// -----------------------------
+// ---------------------------------
 
 export async function listMentions(
   ownerId: string
@@ -344,5 +464,7 @@ export async function listMentions(
 
   handleError(error);
 
-  return (data ?? []).map((row) => mapMention(row as DbRow));
+  return (data ?? []).map((row) =>
+    mapMention(row as DbRow)
+  );
 }
