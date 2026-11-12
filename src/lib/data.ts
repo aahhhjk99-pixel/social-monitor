@@ -173,6 +173,28 @@ function validateGroupInput(
   };
 }
 
+function validateKeywordInput(term: string): string {
+  const cleanTerm = term.trim();
+
+  if (!cleanTerm) {
+    throw new Error("اكتب الكلمة المفتاحية.");
+  }
+
+  if (cleanTerm.length > 200) {
+    throw new Error("الكلمة المفتاحية طويلة جداً.");
+  }
+
+  return cleanTerm;
+}
+
+function validatePriority(
+  priority: KeywordRecord["priority"]
+): void {
+  if (priority !== "normal" && priority !== "high") {
+    throw new Error("الأولوية المحددة غير صحيحة.");
+  }
+}
+
 // ---------------------------------
 // GROUPS
 // ---------------------------------
@@ -233,7 +255,6 @@ export async function createGroup(
   handleError(error);
 }
 
-// تعديل اسم ورابط المجموعة
 export async function updateGroup(
   id: string,
   ownerId: string,
@@ -266,7 +287,6 @@ export async function updateGroup(
   }
 }
 
-// تغيير حالة المجموعة
 export async function setGroupStatus(
   id: string,
   status: GroupRecord["status"]
@@ -299,7 +319,6 @@ export async function setGroupStatus(
   }
 }
 
-// حذف المجموعة
 export async function removeGroup(
   id: string
 ): Promise<void> {
@@ -344,20 +363,20 @@ export async function listKeywords(
   );
 }
 
+// إضافة كلمة مفتاحية مع تحديد الأولوية
 export async function createKeyword(
   ownerId: string,
   term: string,
-  groupId: string | "all"
+  groupId: string | "all",
+  priority: KeywordRecord["priority"] = "normal"
 ): Promise<void> {
   if (!ownerId) {
     throw new Error("الحساب غير مسجل الدخول.");
   }
 
-  const cleanTerm = term.trim();
+  const cleanTerm = validateKeywordInput(term);
 
-  if (!cleanTerm) {
-    throw new Error("اكتب الكلمة المفتاحية.");
-  }
+  validatePriority(priority);
 
   const { error } = await supabase
     .from("keywords")
@@ -366,12 +385,13 @@ export async function createKeyword(
       keyword: cleanTerm,
       group_id: groupId === "all" ? null : groupId,
       is_active: true,
-      priority: "normal"
+      priority
     });
 
   handleError(error);
 }
 
+// تعديل كلمة مفتاحية
 export async function updateKeyword(
   id: string,
   changes: Partial<KeywordRecord>
@@ -383,20 +403,15 @@ export async function updateKeyword(
   const update: Record<string, unknown> = {};
 
   if (typeof changes.term === "string") {
-    const cleanTerm = changes.term.trim();
-
-    if (!cleanTerm) {
-      throw new Error("اكتب الكلمة المفتاحية.");
-    }
-
-    update.keyword = cleanTerm;
+    update.keyword = validateKeywordInput(changes.term);
   }
 
   if (typeof changes.enabled === "boolean") {
     update.is_active = changes.enabled;
   }
 
-  if (changes.priority) {
+  if (changes.priority !== undefined) {
+    validatePriority(changes.priority);
     update.priority = changes.priority;
   }
 
@@ -425,6 +440,7 @@ export async function updateKeyword(
   }
 }
 
+// حذف كلمة مفتاحية
 export async function removeKeyword(
   id: string
 ): Promise<void> {
