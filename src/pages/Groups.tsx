@@ -1,4 +1,3 @@
-
 import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { Link } from "react-router-dom";
@@ -10,7 +9,10 @@ import {
   Plus,
   Users,
   Trash2,
-  RefreshCw
+  RefreshCw,
+  Pencil,
+  Save,
+  X
 } from "lucide-react";
 
 import { useAuth } from "../auth/AuthContext";
@@ -20,7 +22,8 @@ import {
   listGroups,
   newGroupId,
   removeGroup,
-  setGroupStatus
+  setGroupStatus,
+  updateGroup
 } from "../lib/data";
 
 import type { GroupRecord } from "../types";
@@ -101,11 +104,7 @@ function getErrorMessage(error: unknown): string {
     return message;
   }
 
-  if (
-    error &&
-    typeof error === "object" &&
-    "message" in error
-  ) {
+  if (error && typeof error === "object" && "message" in error) {
     return String(error.message);
   }
 
@@ -128,11 +127,11 @@ function formatDate(timestamp: number): string {
 
 function validateGroupUrl(value: string): boolean {
   try {
-    const url = new URL(value);
+    const parsed = new URL(value);
 
     return (
-      url.protocol === "https:" ||
-      url.protocol === "http:"
+      parsed.protocol === "https:" ||
+      parsed.protocol === "http:"
     );
   } catch {
     return false;
@@ -159,6 +158,11 @@ export default function Groups() {
   const [rowBusyId, setRowBusyId] =
     useState<string | null>(null);
 
+  // حالة تعديل المجموعة
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editName, setEditName] = useState("");
+  const [editUrl, setEditUrl] = useState("");
+
   const pendingSaveRef = useRef<PendingSave | null>(null);
   const submittingRef = useRef(false);
 
@@ -173,7 +177,6 @@ export default function Groups() {
     }
 
     const result = await listGroups(user.uid);
-
     setGroups(result);
 
     return result;
@@ -307,7 +310,6 @@ export default function Groups() {
         "انتهت مهلة الانتظار بعد 20 ثانية. لم يصل تأكيد الحفظ بعد."
       );
 
-      // فشل الحفظ
       if (!result.ok) {
         if (pendingSaveRef.current?.id === pending.id) {
           pendingSaveRef.current = null;
@@ -322,12 +324,10 @@ export default function Groups() {
         return;
       }
 
-      // تأكد أن العملية ما زالت تخص الطلب الحالي
       if (pendingSaveRef.current?.id !== pending.id) {
         return;
       }
 
-      // إضافة المجموعة محلياً
       const savedGroup: GroupRecord = {
         id: pending.id,
         ownerId: pending.ownerId,
@@ -352,7 +352,6 @@ export default function Groups() {
 
       setSuccess("تم حفظ المجموعة بنجاح.");
 
-      // تحديث القائمة من قاعدة البيانات
       try {
         await withTimeout(
           refreshGroups(),
@@ -368,11 +367,7 @@ export default function Groups() {
     } catch (err) {
       const message = getErrorMessage(err);
 
-      // لا نحذف الطلب المعلق عند انتهاء المهلة
-      // حتى نتمكن من متابعة نفس العملية دون إنشاء طلب جديد
-      if (
-        message.includes("مهلة الانتظار")
-      ) {
+      if (message.includes("مهلة الانتظار")) {
         setError(
           "انتهت مهلة الانتظار. لم يصل تأكيد Supabase بعد.\n" +
           "بيانات المجموعة محفوظة مؤقتاً في النموذج. اضغط متابعة تأكيد الحفظ، ولن ننشئ طلباً جديداً."
@@ -387,13 +382,112 @@ export default function Groups() {
   }
 
   // ---------------------------------
-  // إرسال النموذج
+  // إرسال نموذج الإضافة
   // ---------------------------------
 
   async function submit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
-
     await finishPendingSave();
+  }
+
+  // ---------------------------------
+  // بدء تعديل المجموعة
+  // ---------------------------------
+
+  function startEdit(group: GroupRecord) {
+    if (rowBusyId || busy || pendingSave) return;
+
+    setError("");
+    setSuccess("");
+
+    setEditingId(group.id);
+    setEditName(group.name);
+    setEditUrl(group.url);
+  }
+
+  // ---------------------------------
+  // إلغاء التعديل
+  // ---------------------------------
+
+  function cancelEdit() {
+    setEditingId(null);
+    setEditName("");
+    setEditUrl("");
+    setError("");
+  }
+
+  // ---------------------------------
+  // حفظ تعديل المجموعة
+  // ---------------------------------
+
+  async function saveEdit(group: GroupRecord) {
+    if (!user?.uid || rowBusyId || busy) return;
+
+    const cleanName = editName.trim();
+    const cleanUrl = editUrl.trim();
+
+    setError("");
+    setSuccess("");
+
+    if (!cleanName) {
+      setError("اكتب اسم المجموعة.");
+      return;
+    }
+
+    if (!cleanUrl) {
+      setError("اكتب رابط المجموعة.");
+      return;
+    }
+
+    if (!validateGroupUrl(cleanUrl)) {
+      setError("رابط المجموعة غير صحيح.");
+      return;
+    }
+
+    if (
+      cleanName === group.name &&
+      cleanUrl === group.url
+    ) {
+      cancelEdit();
+      setSuccess("لم يتم إجراء أي تغييرات.");
+      return;
+    }
+
+    setRowBusyId(group.id);
+
+    try {
+      await updateGroup(
+        group.id,
+        user.uid,
+        cleanName,
+        cleanUrl
+      );
+
+      setGroups((current) =>
+        current.map((item) =>
+          item.id === group.id
+            ? {
+                ...item,
+                name: cleanName,
+                url: cleanUrl
+              }
+            : item
+        )
+      );
+
+      setEditingId(null);
+      setEditName("");
+      setEditUrl("");
+
+      setSuccess("تم تعديل المجموعة وحفظ التغييرات بنجاح.");
+    } catch (err) {
+      setError(
+        "تعذر تعديل المجموعة.\n" +
+        getErrorMessage(err)
+      );
+    } finally {
+      setRowBusyId(null);
+    }
   }
 
   // ---------------------------------
@@ -401,7 +495,7 @@ export default function Groups() {
   // ---------------------------------
 
   async function toggle(group: GroupRecord) {
-    if (rowBusyId || busy) return;
+    if (rowBusyId || busy || editingId) return;
 
     setError("");
     setSuccess("");
@@ -414,10 +508,7 @@ export default function Groups() {
         : "active";
 
     try {
-      await setGroupStatus(
-        group.id,
-        nextStatus
-      );
+      await setGroupStatus(group.id, nextStatus);
 
       setGroups((current) =>
         current.map((item) =>
@@ -447,7 +538,7 @@ export default function Groups() {
   // ---------------------------------
 
   async function remove(group: GroupRecord) {
-    if (rowBusyId || busy) return;
+    if (rowBusyId || busy || editingId) return;
 
     const confirmed = window.confirm(
       `هل أنت متأكد من حذف المجموعة "${group.name}"؟`
@@ -464,9 +555,7 @@ export default function Groups() {
       await removeGroup(group.id);
 
       setGroups((current) =>
-        current.filter(
-          (item) => item.id !== group.id
-        )
+        current.filter((item) => item.id !== group.id)
       );
 
       setSuccess("تم حذف المجموعة بنجاح.");
@@ -485,11 +574,10 @@ export default function Groups() {
   // ---------------------------------
 
   async function handleRefresh() {
-    if (loading || busy || rowBusyId) return;
+    if (loading || busy || rowBusyId || editingId) return;
 
     setError("");
     setSuccess("");
-
     setLoading(true);
 
     try {
@@ -630,7 +718,12 @@ export default function Groups() {
             type="button"
             title="تحديث القائمة"
             onClick={() => void handleRefresh()}
-            disabled={loading || busy || Boolean(rowBusyId)}
+            disabled={
+              loading ||
+              busy ||
+              Boolean(rowBusyId) ||
+              Boolean(editingId)
+            }
           >
             <RefreshCw size={16} />
           </button>
@@ -657,6 +750,7 @@ export default function Groups() {
         <div className="groups-grid">
           {groups.map((group) => {
             const rowBusy = rowBusyId === group.id;
+            const isEditing = editingId === group.id;
 
             return (
               <article
@@ -679,61 +773,155 @@ export default function Groups() {
                   </span>
                 </div>
 
-                <h3>{group.name}</h3>
+                {isEditing ? (
+                  <div className="group-edit-form">
+                    <label>
+                      اسم المجموعة
 
-                <p className="group-url">
-                  {group.url}
-                </p>
+                      <input
+                        value={editName}
+                        onChange={(e) =>
+                          setEditName(e.target.value)
+                        }
+                        placeholder="اسم المجموعة"
+                        disabled={rowBusy}
+                        autoFocus
+                      />
+                    </label>
+
+                    <label>
+                      رابط المجموعة
+
+                      <input
+                        type="url"
+                        value={editUrl}
+                        onChange={(e) =>
+                          setEditUrl(e.target.value)
+                        }
+                        placeholder="رابط المجموعة"
+                        disabled={rowBusy}
+                      />
+                    </label>
+                  </div>
+                ) : (
+                  <>
+                    <h3>{group.name}</h3>
+
+                    <p className="group-url">
+                      {group.url}
+                    </p>
+                  </>
+                )}
 
                 <div className="group-meta">
                   أضيفت {formatDate(group.createdAt)}
                 </div>
 
                 <div className="card-actions">
-                  <Link
-                    className="secondary-btn"
-                    to={`/groups/${group.id}`}
-                  >
-                    فتح الصفحة
-                  </Link>
+                  {isEditing ? (
+                    <>
+                      <button
+                        className="primary-btn"
+                        type="button"
+                        onClick={() => void saveEdit(group)}
+                        disabled={rowBusy}
+                      >
+                        {rowBusy ? (
+                          <>
+                            <RefreshCw size={16} />
+                            جارٍ الحفظ...
+                          </>
+                        ) : (
+                          <>
+                            <Save size={16} />
+                            حفظ التعديل
+                          </>
+                        )}
+                      </button>
 
-                  <button
-                    className="icon-btn"
-                    title={
-                      group.status === "active"
-                        ? "إيقاف المجموعة"
-                        : "تفعيل المجموعة"
-                    }
-                    onClick={() => void toggle(group)}
-                    type="button"
-                    disabled={rowBusy || Boolean(rowBusyId) || busy}
-                  >
-                    {group.status === "active" ? (
-                      <Pause size={16} />
-                    ) : (
-                      <Play size={16} />
-                    )}
-                  </button>
+                      <button
+                        className="icon-btn"
+                        type="button"
+                        title="إلغاء التعديل"
+                        onClick={cancelEdit}
+                        disabled={rowBusy}
+                      >
+                        <X size={16} />
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <Link
+                        className="secondary-btn"
+                        to={`/groups/${group.id}`}
+                      >
+                        فتح الصفحة
+                      </Link>
 
-                  <a
-                    className="icon-btn"
-                    href={group.url}
-                    target="_blank"
-                    rel="noreferrer"
-                    title="فتح المجموعة الأصلية"
-                  >
-                    <ExternalLink size={16} />
-                  </a>
+                      <button
+                        className="icon-btn"
+                        title="تعديل المجموعة"
+                        type="button"
+                        onClick={() => startEdit(group)}
+                        disabled={
+                          rowBusy ||
+                          Boolean(rowBusyId) ||
+                          busy ||
+                          Boolean(editingId)
+                        }
+                      >
+                        <Pencil size={16} />
+                      </button>
 
-                  <button
-                    className="icon-btn danger-icon"
-                    title="حذف المجموعة"
-                    onClick={() => void remove(group)}
-                    type="button"
-                    disabled={rowBusy || Boolean(rowBusyId) || busy}
-                  >
-                    <Trash2 size={16} />
-                  </button>
+                      <button
+                        className="icon-btn"
+                        title={
+                          group.status === "active"
+                            ? "إيقاف المجموعة"
+                            : "تفعيل المجموعة"
+                        }
+                        onClick={() => void toggle(group)}
+                        type="button"
+                        disabled={
+                          rowBusy ||
+                          Boolean(rowBusyId) ||
+                          busy ||
+                          Boolean(editingId)
+                        }
+                      >
+                        {group.status === "active" ? (
+                          <Pause size={16} />
+                        ) : (
+                          <Play size={16} />
+                        )}
+                      </button>
+
+                      <a
+                        className="icon-btn"
+                        href={group.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        title="فتح المجموعة الأصلية"
+                      >
+                        <ExternalLink size={16} />
+                      </a>
+
+                      <button
+                        className="icon-btn danger-icon"
+                        title="حذف المجموعة"
+                        onClick={() => void remove(group)}
+                        type="button"
+                        disabled={
+                          rowBusy ||
+                          Boolean(rowBusyId) ||
+                          busy ||
+                          Boolean(editingId)
+                        }
+                      >
+                        <Trash2 size={16} />
+                      </button>
+                    </>
+                  )}
                 </div>
               </article>
             );
