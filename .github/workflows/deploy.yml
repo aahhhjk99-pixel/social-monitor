@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+
   workflow_dispatch:
 
 permissions:
@@ -29,7 +30,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
 
       - name: Install dependencies
         run: npm install
@@ -47,6 +47,7 @@ jobs:
         run: |
           test -f dist/index.html
           test -f dist/404.html
+          echo "Build files verified successfully."
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
