@@ -1,4 +1,5 @@
 
+import type { ReactNode } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
 
 import { useAuth } from "./auth/AuthContext";
@@ -13,12 +14,13 @@ import Mentions from "./pages/Mentions";
 import Notifications from "./pages/Notifications";
 import Settings from "./pages/Settings";
 import Monitoring from "./pages/Monitoring";
+import Analytics from "./pages/Analytics";
 import Placeholder from "./pages/Placeholder";
 
 function Protected({
   children
 }: {
-  children: React.ReactNode;
+  children: ReactNode;
 }) {
   const { user, loading } = useAuth();
 
@@ -50,6 +52,7 @@ export default function App() {
 
   return (
     <Routes>
+      {/* تسجيل الدخول */}
       <Route
         path="/login"
         element={
@@ -57,6 +60,7 @@ export default function App() {
         }
       />
 
+      {/* الصفحات المحمية */}
       <Route
         path="/"
         element={
@@ -65,39 +69,51 @@ export default function App() {
           </Protected>
         }
       >
+        {/* الرئيسية */}
         <Route index element={<Dashboard />} />
 
+        {/* المراقبة */}
         <Route
           path="monitoring"
           element={<Monitoring />}
         />
 
-        <Route path="groups" element={<Groups />} />
+        {/* المجموعات */}
+        <Route
+          path="groups"
+          element={<Groups />}
+        />
 
         <Route
           path="groups/:id"
           element={<GroupDetail />}
         />
 
-        <Route path="mentions" element={<Mentions />} />
+        {/* المنشورات والتنبيهات */}
+        <Route
+          path="mentions"
+          element={<Mentions />}
+        />
 
-        <Route path="keywords" element={<Keywords />} />
+        {/* الكلمات المفتاحية */}
+        <Route
+          path="keywords"
+          element={<Keywords />}
+        />
 
+        {/* الإشعارات */}
         <Route
           path="notifications"
           element={<Notifications />}
         />
 
+        {/* التحليلات الفعلية */}
         <Route
           path="analytics"
-          element={
-            <Placeholder
-              title="التحليلات"
-              description="مقارنات وإحصائيات المجموعات والكلمات."
-            />
-          }
+          element={<Analytics />}
         />
 
+        {/* مصادر البيانات */}
         <Route
           path="sources"
           element={
@@ -108,9 +124,14 @@ export default function App() {
           }
         />
 
-        <Route path="settings" element={<Settings />} />
+        {/* الإعدادات */}
+        <Route
+          path="settings"
+          element={<Settings />}
+        />
       </Route>
 
+      {/* أي مسار غير معروف */}
       <Route
         path="*"
         element={<Navigate to="/" replace />}
