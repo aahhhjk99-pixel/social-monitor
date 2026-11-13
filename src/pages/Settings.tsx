@@ -1,5 +1,8 @@
+
+import { useState } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { supabaseReady } from "../lib/supabase";
+import { subscribeToPush } from "../lib/pushNotifications";
 
 import {
   ShieldCheck,
@@ -9,6 +12,37 @@ import {
 
 export default function Settings() {
   const { user } = useAuth();
+
+  const [pushLoading, setPushLoading] = useState(false);
+  const [pushStatus, setPushStatus] = useState("");
+  const [pushEnabled, setPushEnabled] = useState(
+    typeof Notification !== "undefined" &&
+    Notification.permission === "granted"
+  );
+
+  async function handleEnablePush() {
+    if (!user?.uid) {
+      setPushStatus("يجب تسجيل الدخول أولاً.");
+      return;
+    }
+
+    setPushLoading(true);
+    setPushStatus("");
+
+    try {
+      await subscribeToPush(user.uid);
+      setPushEnabled(true);
+      setPushStatus("تم تفعيل اشتراك إشعارات المتصفح بنجاح.");
+    } catch (error) {
+      setPushStatus(
+        error instanceof Error
+          ? error.message
+          : "تعذر تفعيل إشعارات المتصفح."
+      );
+    } finally {
+      setPushLoading(false);
+    }
+  }
 
   return (
     <div>
@@ -70,9 +104,29 @@ export default function Settings() {
         </div>
 
         <div className="setting-row">
-          <span>الإشعارات الفورية</span>
-          <b className="warn-text">لم تُفعّل بعد</b>
+          <span>إشعارات المتصفح</span>
+          <b className={pushEnabled ? "good-text" : "warn-text"}>
+            {pushEnabled ? "تم منح إذن الإشعارات" : "غير مفعّلة"}
+          </b>
         </div>
+
+        <button
+          type="button"
+          onClick={handleEnablePush}
+          disabled={pushLoading || pushEnabled}
+        >
+          {pushLoading
+            ? "جارٍ التفعيل..."
+            : pushEnabled
+              ? "الإشعارات مفعّلة"
+              : "تفعيل إشعارات المتصفح"}
+        </button>
+
+        {pushStatus && (
+          <p className="muted" role="status">
+            {pushStatus}
+          </p>
+        )}
       </section>
 
       <section className="panel settings-panel">
