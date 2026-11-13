@@ -4,14 +4,17 @@ import {
   Bell,
   ExternalLink,
   CheckCheck,
-  AlertCircle
+  AlertCircle,
+  RefreshCw,
 } from "lucide-react";
 
 import { useAuth } from "../auth/AuthContext";
 import { supabase } from "../lib/supabase";
 import type { NotificationRecord } from "../types";
 
-function mapNotification(row: Record<string, unknown>): NotificationRecord {
+function mapNotification(
+  row: Record<string, unknown>
+): NotificationRecord {
   return {
     id: String(row.id),
     ownerId: String(row.owner_id),
@@ -42,7 +45,7 @@ function mapNotification(row: Record<string, unknown>): NotificationRecord {
     createdAt:
       typeof row.created_at === "string"
         ? new Date(row.created_at).getTime()
-        : Date.now()
+        : Date.now(),
   };
 }
 
@@ -51,104 +54,190 @@ export default function Notifications() {
 
   const [items, setItems] = useState<NotificationRecord[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
   const [updatingId, setUpdatingId] = useState<string | null>(null);
 
-  const loadNotifications = useCallback(async () => {
-    if (!user) {
+  const loadNotifications = useCallback(
+    async (showLoading = true) => {
+      if (!user?.uid) {
+        setItems([]);
+        setLoading(false);
+        return;
+      }
+
+      if (showLoading) setLoading(true);
+
+      setError("");
+
+      try {
+        const { data, error: queryError } = await supabase
+          .from("monitoring_notifications")
+          .select("*")
+          .eq("owner_id", user.uid)
+          .order("created_at", { ascending: false });
+
+        if (queryError) throw queryError;
+
+        setItems(
+          (data ?? []).map((row) =>
+            mapNotification(row as Record<string, unknown>)
+          )
+        );
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : String(err);
+
+        setError(message);
+      } finally {
+        setLoading(false);
+        setRefreshing(false);
+      }
+    },
+    [user?.uid]
+  );
+
+  useEffect(() => {
+    if (!user?.uid) {
       setItems([]);
       setLoading(false);
       return;
     }
 
-    setLoading(true);
-    setError("");
+    let active = true;
+    let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 
-    const { data, error: queryError } = await supabase
-      .from("monitoring_notifications")
-      .select("*")
-      .eq("owner_id", user.uid)
-      .order("created_at", { ascending: false });
+    const refresh = () => {
+      if (!active) return;
 
-    if (queryError) {
-      setError(queryError.message);
-      setItems([]);
-    } else {
-      setItems((data ?? []).map((row) =>
-        mapNotification(row as Record<string, unknown>)
-      ));
-    }
+      if (refreshTimer) clearTimeout(refreshTimer);
 
-    setLoading(false);
-  }, [user]);
+      refreshTimer = setTimeout(() => {
+        if (active) void loadNotifications(false);
+      }, 250);
+    };
 
-  useEffect(() => {
-    void loadNotifications();
-  }, [loadNotifications]);
+    void loadNotifications(true);
+
+    const channel = supabase
+      .channel(`notifications-page-${user.uid}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "monitoring_notifications",
+          filter: `owner_id=eq.${user.uid}`,
+        },
+        () => {
+          refresh();
+        }
+      )
+      .subscribe((status) => {
+        if (status === "SUBSCRIBED") {
+          refresh();
+        }
+
+        if (
+          status === "CHANNEL_ERROR" ||
+          status === "TIMED_OUT"
+        ) {
+          console.error(
+            "Notifications realtime error:",
+            status
+          );
+        }
+      });
+
+    return () => {
+      active = false;
+
+      if (refreshTimer) clearTimeout(refreshTimer);
+
+      void supabase.removeChannel(channel);
+    };
+  }, [user?.uid, loadNotifications]);
 
   async function markAsRead(id: string) {
-    if (!user || updatingId) return;
+    if (!user?.uid || updatingId !== null) return;
 
     setUpdatingId(id);
     setError("");
 
     const readAt = new Date().toISOString();
 
-    const { error: updateError } = await supabase
-      .from("monitoring_notifications")
-      .update({ read_at: readAt })
-      .eq("id", id)
-      .eq("owner_id", user.uid);
+    try {
+      const { error: updateError } = await supabase
+        .from("monitoring_notifications")
+        .update({ read_at: readAt })
+        .eq("id", id)
+        .eq("owner_id", user.uid);
 
-    if (updateError) {
-      setError(updateError.message);
-    } else {
+      if (updateError) throw updateError;
+
       setItems((current) =>
         current.map((item) =>
           item.id === id
-            ? { ...item, readAt: Date.now() }
+            ? { ...item, readAt: new Date(readAt).getTime() }
             : item
         )
       );
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : String(err)
+      );
+    } finally {
+      setUpdatingId(null);
     }
-
-    setUpdatingId(null);
   }
 
   async function markAllAsRead() {
-    if (!user || updatingId) return;
+    if (!user?.uid || updatingId !== null) return;
 
-    const unreadIds = items
-      .filter((item) => !item.readAt)
-      .map((item) => item.id);
+    const unreadCount = items.filter(
+      (item) => !item.readAt
+    ).length;
 
-    if (unreadIds.length === 0) return;
+    if (unreadCount === 0) return;
 
     setUpdatingId("all");
     setError("");
 
-    const { error: updateError } = await supabase
-      .from("monitoring_notifications")
-      .update({ read_at: new Date().toISOString() })
-      .eq("owner_id", user.uid)
-      .is("read_at", null);
+    const readAt = new Date().toISOString();
 
-    if (updateError) {
-      setError(updateError.message);
-    } else {
-      const now = Date.now();
+    try {
+      const { error: updateError } = await supabase
+        .from("monitoring_notifications")
+        .update({ read_at: readAt })
+        .eq("owner_id", user.uid)
+        .is("read_at", null);
+
+      if (updateError) throw updateError;
+
+      const now = new Date(readAt).getTime();
 
       setItems((current) =>
         current.map((item) =>
           item.readAt ? item : { ...item, readAt: now }
         )
       );
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : String(err)
+      );
+    } finally {
+      setUpdatingId(null);
     }
-
-    setUpdatingId(null);
   }
 
-  const unreadCount = items.filter((item) => !item.readAt).length;
+  async function refreshManually() {
+    setRefreshing(true);
+    await loadNotifications(false);
+  }
+
+  const unreadCount = items.filter(
+    (item) => !item.readAt
+  ).length;
 
   return (
     <div>
@@ -156,7 +245,9 @@ export default function Notifications() {
         <div>
           <span className="eyebrow">مركز التنبيهات</span>
           <h1>الإشعارات</h1>
-          <p>التنبيهات والنتائج المرتبطة بالكلمات المفتاحية.</p>
+          <p>
+            التنبيهات والنتائج المرتبطة بالكلمات المفتاحية.
+          </p>
         </div>
 
         <span className="count-pill">
@@ -175,17 +266,41 @@ export default function Notifications() {
         <div className="toolbar">
           <div>
             <h2>سجل التنبيهات</h2>
-            <p>التنبيهات المحفوظة في قاعدة البيانات.</p>
+            <p>
+              التنبيهات المحفوظة في قاعدة البيانات.
+            </p>
           </div>
 
-          <button
-            className="secondary-btn"
-            onClick={markAllAsRead}
-            disabled={unreadCount === 0 || updatingId !== null}
+          <div
+            style={{
+              display: "flex",
+              gap: 8,
+              flexWrap: "wrap",
+            }}
           >
-            <CheckCheck size={16} />
-            تحديد الكل كمقروء
-          </button>
+            <button
+              className="secondary-btn"
+              onClick={() => void refreshManually()}
+              disabled={loading || refreshing}
+            >
+              <RefreshCw
+                size={16}
+                className={refreshing ? "spin" : ""}
+              />
+              تحديث
+            </button>
+
+            <button
+              className="secondary-btn"
+              onClick={() => void markAllAsRead()}
+              disabled={
+                unreadCount === 0 || updatingId !== null
+              }
+            >
+              <CheckCheck size={16} />
+              تحديد الكل كمقروء
+            </button>
+          </div>
         </div>
 
         {loading ? (
@@ -196,7 +311,9 @@ export default function Notifications() {
           <div className="empty-state">
             <Bell size={28} />
             <b>لا توجد إشعارات</b>
-            <p>ستظهر هنا التنبيهات عند تسجيلها في قاعدة البيانات.</p>
+            <p>
+              ستظهر هنا التنبيهات عند تسجيلها في قاعدة البيانات.
+            </p>
           </div>
         ) : (
           <div className="mention-list">
@@ -220,12 +337,15 @@ export default function Notifications() {
                   <p>{item.message}</p>
 
                   <small>
-                    {new Date(item.createdAt).toLocaleString("ar")}
+                    {new Date(
+                      item.createdAt
+                    ).toLocaleString("ar")}
                   </small>
 
                   {item.deliveryStatus === "failed" && (
                     <small className="notice error">
-                      تعذر إرسال التنبيه: {item.deliveryError || "سبب غير محدد"}
+                      تعذر إرسال التنبيه:{" "}
+                      {item.deliveryError || "سبب غير محدد"}
                     </small>
                   )}
 
@@ -234,7 +354,7 @@ export default function Notifications() {
                       className="secondary-btn inline-btn"
                       href={item.sourceUrl}
                       target="_blank"
-                      rel="noreferrer"
+                      rel="noopener noreferrer"
                     >
                       فتح المنشور
                       <ExternalLink size={15} />
