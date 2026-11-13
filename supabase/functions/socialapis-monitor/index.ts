@@ -1,3 +1,4 @@
+
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
 
@@ -7,6 +8,8 @@ const corsHeaders = {
     "authorization, apikey, x-client-info, content-type",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
+
+const PAGE_SIZE = 500;
 
 const json = (data: unknown, status = 200) =>
   new Response(JSON.stringify(data), {
@@ -77,6 +80,159 @@ function extractPost(post: any) {
   };
 }
 
+/**
+ * Checks whether a notification already exists for a detected item.
+ */
+async function findExistingNotification(
+  supabase: any,
+  detectedItemId: string
+) {
+  const { data, error } = await supabase
+    .from("monitoring_notifications")
+    .select("id")
+    .eq("detected_item_id", detectedItemId)
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw error;
+
+  return data;
+}
+
+/**
+ * Ensures that a detected item has a notification.
+ *
+ * The detected item's notification_sent flag is updated
+ * only after the notification is confirmed to exist.
+ */
+async function ensureNotification(
+  supabase: any,
+  ownerId: string,
+  item: any
+): Promise<"created" | "existing"> {
+  const existing = await findExistingNotification(
+    supabase,
+    item.id
+  );
+
+  let result: "created" | "existing" = "existing";
+
+  if (!existing) {
+    const terms = Array.isArray(item.matched_terms)
+      ? item.matched_terms.filter(Boolean)
+      : [];
+
+    const { error: insertError } = await supabase
+      .from("monitoring_notifications")
+      .insert({
+        owner_id: ownerId,
+        detected_item_id: item.id,
+        title: "تم العثور على منشور مطابق",
+        message: `الكلمات المطابقة: ${terms.join("، ")}`,
+        source_url: item.source_url ?? null,
+        delivery_status: "pending",
+      });
+
+    if (insertError) {
+      // A concurrent execution may have inserted it.
+      const notificationAfterError =
+        await findExistingNotification(supabase, item.id);
+
+      if (!notificationAfterError) {
+        throw new Error(
+          `Notification creation failed for item ${item.id}: ${insertError.message}`
+        );
+      }
+    } else {
+      result = "created";
+    }
+  }
+
+  const { error: markError } = await supabase
+    .from("detected_items")
+    .update({ notification_sent: true })
+    .eq("id", item.id)
+    .eq("owner_id", ownerId);
+
+  if (markError) {
+    throw new Error(
+      `Failed to mark notification as sent for item ${item.id}: ${markError.message}`
+    );
+  }
+
+  return result;
+}
+
+/**
+ * Retries notifications for all previously detected items
+ * that are still marked notification_sent = false.
+ *
+ * Uses keyset pagination so updating rows does not cause
+ * records to be skipped by offset pagination.
+ */
+async function retryPendingNotifications(
+  supabase: any,
+  ownerId: string,
+  groupId: string
+) {
+  let cursor: string | null = null;
+  let created = 0;
+  let alreadyExisting = 0;
+  let processed = 0;
+
+  while (true) {
+    let query = supabase
+      .from("detected_items")
+      .select("id, matched_terms, source_url")
+      .eq("owner_id", ownerId)
+      .eq("group_id", groupId)
+      .eq("notification_sent", false)
+      .order("id", { ascending: true })
+      .limit(PAGE_SIZE);
+
+    if (cursor) {
+      query = query.gt("id", cursor);
+    }
+
+    const { data: pendingItems, error: pendingError } =
+      await query;
+
+    if (pendingError) throw pendingError;
+
+    if (!pendingItems || pendingItems.length === 0) {
+      break;
+    }
+
+    for (const item of pendingItems) {
+      const result = await ensureNotification(
+        supabase,
+        ownerId,
+        item
+      );
+
+      if (result === "created") {
+        created++;
+      } else {
+        alreadyExisting++;
+      }
+
+      processed++;
+    }
+
+    cursor = pendingItems[pendingItems.length - 1].id;
+
+    if (pendingItems.length < PAGE_SIZE) {
+      break;
+    }
+  }
+
+  return {
+    processed,
+    created,
+    already_existing: alreadyExisting,
+  };
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
@@ -94,14 +250,19 @@ Deno.serve(async (req: Request) => {
   const socialApiToken = Deno.env.get("SOCIALAPIS_API_TOKEN");
 
   if (!supabaseUrl || !serviceKey || !socialApiToken) {
-    return json({
-      success: false,
-      error: "Missing required server environment variables",
-    }, 500);
+    return json(
+      {
+        success: false,
+        error: "Missing required server environment variables",
+      },
+      500
+    );
   }
 
   const authorization = req.headers.get("Authorization") ?? "";
-  const bearer = authorization.replace(/^Bearer\s+/i, "").trim();
+  const bearer = authorization
+    .replace(/^Bearer\s+/i, "")
+    .trim();
 
   if (!bearer || bearer !== serviceKey) {
     return json(
@@ -162,9 +323,11 @@ Deno.serve(async (req: Request) => {
 
       if (groupError) throw groupError;
       if (!group) throw new Error("Group not found");
+
       if (group.status !== "active") {
         throw new Error("Group is not active");
       }
+
       if (!group.url) {
         throw new Error("Group URL is missing");
       }
@@ -186,6 +349,7 @@ Deno.serve(async (req: Request) => {
             .single();
 
         if (createRunError) throw createRunError;
+
         activeRunId = newRun.id;
       } else {
         const { error: runStartError } = await supabase
@@ -241,7 +405,7 @@ Deno.serve(async (req: Request) => {
         method: "GET",
         headers: {
           "x-api-token": socialApiToken,
-          "Accept": "application/json",
+          Accept: "application/json",
         },
       });
 
@@ -277,7 +441,6 @@ Deno.serve(async (req: Request) => {
       const posts = extractPosts(apiData);
 
       let matchesFound = 0;
-      let notificationsCreated = 0;
       let skippedPosts = 0;
 
       for (const rawPost of posts) {
@@ -298,75 +461,44 @@ Deno.serve(async (req: Request) => {
           )
           .map((item: any) => item.keyword);
 
-        if (matchedTerms.length === 0) continue;
-
-        matchesFound++;
-
-        const { data: insertedItems, error: insertError } =
-          await supabase
-            .from("detected_items")
-            .upsert(
-              {
-                owner_id: ownerId,
-                group_id: groupId,
-                run_id: activeRunId,
-                external_id: post.id,
-                content_type: "post",
-                content: post.content,
-                source_url: post.url,
-                matched_terms: matchedTerms,
-                detected_at: new Date().toISOString(),
-                notification_sent: false,
-              },
-              {
-                onConflict: "owner_id,group_id,external_id",
-                ignoreDuplicates: true,
-              }
-            )
-            .select("id");
-
-        if (insertError) throw insertError;
-
-        // Ignore existing posts to prevent duplicate alerts.
-        if (!insertedItems || insertedItems.length === 0) {
+        if (matchedTerms.length === 0) {
           continue;
         }
 
-        const itemId = insertedItems[0].id;
+        matchesFound++;
 
-        const { error: notificationError } = await supabase
-          .from("monitoring_notifications")
-          .insert({
-            owner_id: ownerId,
-            detected_item_id: itemId,
-            title: "تم العثور على منشور مطابق",
-            message: `الكلمات المطابقة: ${matchedTerms.join("، ")}`,
-            source_url: post.url,
-            delivery_status: "pending",
-          });
-
-        if (notificationError) {
-          console.error(
-            "Notification insert failed:",
-            notificationError.message
+        const { error: insertError } = await supabase
+          .from("detected_items")
+          .upsert(
+            {
+              owner_id: ownerId,
+              group_id: groupId,
+              run_id: activeRunId,
+              external_id: post.id,
+              content_type: "post",
+              content: post.content,
+              source_url: post.url,
+              matched_terms: matchedTerms,
+              detected_at: new Date().toISOString(),
+              notification_sent: false,
+            },
+            {
+              onConflict: "owner_id,group_id,external_id",
+              ignoreDuplicates: true,
+            }
           );
-        } else {
-          notificationsCreated++;
 
-          const { error: markError } = await supabase
-            .from("detected_items")
-            .update({ notification_sent: true })
-            .eq("id", itemId)
-            .eq("owner_id", ownerId);
-
-          if (markError) {
-            console.error(
-              "Notification flag update failed:",
-              markError.message
-            );
-          }
-        }
+        if (insertError) throw insertError;
       }
+
+      // Retry notifications for both newly detected items
+      // and older items whose notification creation previously failed.
+      const notificationSummary =
+        await retryPendingNotifications(
+          supabase,
+          ownerId,
+          groupId
+        );
 
       const finishedAt = new Date().toISOString();
 
@@ -403,7 +535,12 @@ Deno.serve(async (req: Request) => {
         posts_checked: posts.length,
         skipped_posts: skippedPosts,
         matches_found: matchesFound,
-        notifications_created: notificationsCreated,
+        notifications_processed:
+          notificationSummary.processed,
+        notifications_created:
+          notificationSummary.created,
+        notifications_already_existing:
+          notificationSummary.already_existing,
       });
 
     } catch (error) {
@@ -462,4 +599,3 @@ Deno.serve(async (req: Request) => {
     results,
   });
 });
-             
