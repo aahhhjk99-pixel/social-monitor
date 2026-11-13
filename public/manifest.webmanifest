@@ -1,0 +1,23 @@
+
+{
+  "id": "/social-monitor/",
+  "name": "Social Monitor",
+  "short_name": "Social Monitor",
+  "description": "منصة مراقبة وتحليل الإشارات العامة",
+  "lang": "ar",
+  "dir": "rtl",
+  "start_url": "/social-monitor/",
+  "scope": "/social-monitor/",
+  "display": "standalone",
+  "display_override": [
+    "standalone",
+    "minimal-ui"
+  ],
+  "orientation": "any",
+  "background_color": "#101114",
+  "theme_color": "#101114",
+  "categories": [
+    "productivity",
+    "utilities"
+  ]
+}
