@@ -9,9 +9,9 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-const PAGE_SIZE = 500;
 const API_PAGE_SIZE = 9;
-const CHECKPOINT_OVERLAP_MS = 2 * 60 * 1000;
+const LOOKBACK_HOURS = 9;
+const PAGE_TIMEOUT_MS = 20000;
 
 const json = (data: unknown, status = 200) =>
   new Response(JSON.stringify(data), {
@@ -97,9 +97,6 @@ function extractPost(post: any) {
   };
 }
 
-/**
- * Find an existing notification for a detected item.
- */
 async function findExistingNotification(
   supabase: any,
   detectedItemId: string
@@ -112,13 +109,9 @@ async function findExistingNotification(
     .maybeSingle();
 
   if (error) throw error;
-
   return data;
 }
 
-/**
- * Create a notification if it does not already exist.
- */
 async function ensureNotification(
   supabase: any,
   ownerId: string,
@@ -148,15 +141,14 @@ async function ensureNotification(
       });
 
     if (insertError) {
-      const notificationAfterError =
-        await findExistingNotification(
-          supabase,
-          item.id
-        );
+      const afterError = await findExistingNotification(
+        supabase,
+        item.id
+      );
 
-      if (!notificationAfterError) {
+      if (!afterError) {
         throw new Error(
-          `Notification creation failed for item ${item.id}: ${insertError.message}`
+          `Notification creation failed: ${insertError.message}`
         );
       }
     } else {
@@ -172,17 +164,13 @@ async function ensureNotification(
 
   if (markError) {
     throw new Error(
-      `Failed to mark notification as sent for item ${item.id}: ${markError.message}`
+      `Failed to mark notification as sent: ${markError.message}`
     );
   }
 
   return result;
 }
 
-/**
- * Retry notifications that were not created successfully.
- * Uses keyset pagination.
- */
 async function retryPendingNotifications(
   supabase: any,
   ownerId: string,
@@ -201,42 +189,33 @@ async function retryPendingNotifications(
       .eq("group_id", groupId)
       .eq("notification_sent", false)
       .order("id", { ascending: true })
-      .limit(PAGE_SIZE);
+      .limit(500);
 
     if (cursor) {
       query = query.gt("id", cursor);
     }
 
-    const { data: pendingItems, error: pendingError } =
-      await query;
+    const { data, error } = await query;
 
-    if (pendingError) throw pendingError;
+    if (error) throw error;
+    if (!data || data.length === 0) break;
 
-    if (!pendingItems || pendingItems.length === 0) {
-      break;
-    }
-
-    for (const item of pendingItems) {
+    for (const item of data) {
       const result = await ensureNotification(
         supabase,
         ownerId,
         item
       );
 
-      if (result === "created") {
-        created++;
-      } else {
-        alreadyExisting++;
-      }
+      if (result === "created") created++;
+      else alreadyExisting++;
 
       processed++;
     }
 
-    cursor = pendingItems[pendingItems.length - 1].id;
+    cursor = data[data.length - 1].id;
 
-    if (pendingItems.length < PAGE_SIZE) {
-      break;
-    }
+    if (data.length < 500) break;
   }
 
   return {
@@ -247,12 +226,13 @@ async function retryPendingNotifications(
 }
 
 /**
- * Fetch every available page of posts for the selected time range.
- * Does not silently treat a partial pagination response as complete.
+ * يجلب المنشورات ضمن نافذة زمنية ثابتة:
+ * آخر 9 ساعات فقط، وحتى وقت بداية الفحص.
  */
 async function fetchAllGroupPosts(
   groupUrl: string,
   afterTime: string,
+  beforeTime: string,
   socialApiToken: string
 ) {
   const posts: any[] = [];
@@ -271,28 +251,27 @@ async function fetchAllGroupPosts(
     );
 
     apiUrl.searchParams.set("link", groupUrl);
-    apiUrl.searchParams.set(
-      "limit",
-      String(API_PAGE_SIZE)
-    );
+    apiUrl.searchParams.set("limit", String(API_PAGE_SIZE));
     apiUrl.searchParams.set("timezone", "UTC");
     apiUrl.searchParams.set("after_time", afterTime);
+    apiUrl.searchParams.set("before_time", beforeTime);
 
     if (nextCursor) {
       apiUrl.searchParams.set("end_cursor", nextCursor);
     }
 
     const controller = new AbortController();
+
     const timeout = setTimeout(
       () => controller.abort(),
-      90000
+      PAGE_TIMEOUT_MS
     );
 
-    let apiResponse: Response;
+    let response: Response;
     let responseText: string;
 
     try {
-      apiResponse = await fetch(apiUrl.toString(), {
+      response = await fetch(apiUrl.toString(), {
         method: "GET",
         headers: {
           "x-api-token": socialApiToken,
@@ -301,7 +280,7 @@ async function fetchAllGroupPosts(
         signal: controller.signal,
       });
 
-      responseText = await apiResponse.text();
+      responseText = await response.text();
     } catch (error) {
       if (
         error instanceof Error &&
@@ -317,9 +296,9 @@ async function fetchAllGroupPosts(
       clearTimeout(timeout);
     }
 
-    if (!apiResponse.ok) {
+    if (!response.ok) {
       throw new Error(
-        `SocialAPIs HTTP ${apiResponse.status}: ${responseText.slice(0, 500)}`
+        `SocialAPIs HTTP ${response.status}: ${responseText.slice(0, 500)}`
       );
     }
 
@@ -328,15 +307,10 @@ async function fetchAllGroupPosts(
     try {
       apiData = JSON.parse(responseText);
     } catch {
-      throw new Error(
-        "SocialAPIs returned invalid JSON"
-      );
+      throw new Error("SocialAPIs returned invalid JSON");
     }
 
-    if (
-      apiData?.success === false ||
-      apiData?.error
-    ) {
+    if (apiData?.success === false || apiData?.error) {
       throw new Error(
         String(
           apiData?.message ??
@@ -356,10 +330,7 @@ async function fetchAllGroupPosts(
         continue;
       }
 
-      if (post.id) {
-        seenPostIds.add(post.id);
-      }
-
+      if (post.id) seenPostIds.add(post.id);
       posts.push(rawPost);
     }
 
@@ -370,7 +341,7 @@ async function fetchAllGroupPosts(
       seenCursors.has(returnedCursor)
     ) {
       throw new Error(
-        "SocialAPIs returned a repeated pagination cursor. Scan stopped to prevent an infinite loop."
+        "SocialAPIs returned a repeated pagination cursor."
       );
     }
 
@@ -378,10 +349,7 @@ async function fetchAllGroupPosts(
       seenCursors.add(returnedCursor);
     }
 
-    if (
-      returnedCursor &&
-      pagePosts.length === 0
-    ) {
+    if (returnedCursor && pagePosts.length === 0) {
       throw new Error(
         "SocialAPIs returned a next-page cursor with an empty posts page."
       );
@@ -392,11 +360,11 @@ async function fetchAllGroupPosts(
       page_posts: pagePosts.length,
       total_unique_posts: posts.length,
       has_next_page: Boolean(returnedCursor),
+      after_time: afterTime,
+      before_time: beforeTime,
     });
 
-    if (!returnedCursor) {
-      break;
-    }
+    if (!returnedCursor) break;
 
     nextCursor = returnedCursor;
   }
@@ -434,11 +402,7 @@ Deno.serve(async (req: Request) => {
     "SOCIALAPIS_API_TOKEN"
   );
 
-  if (
-    !supabaseUrl ||
-    !serviceKey ||
-    !socialApiToken
-  ) {
+  if (!supabaseUrl || !serviceKey || !socialApiToken) {
     return json(
       {
         success: false,
@@ -513,11 +477,7 @@ Deno.serve(async (req: Request) => {
     let activeRunId = runId;
 
     try {
-      if (
-        !jobId ||
-        !ownerId ||
-        !groupId
-      ) {
+      if (!jobId || !ownerId || !groupId) {
         throw new Error(
           "Job is missing required identifiers"
         );
@@ -526,31 +486,20 @@ Deno.serve(async (req: Request) => {
       const { data: group, error: groupError } =
         await supabase
           .from("groups")
-          .select(
-            "id, owner_id, name, url, status"
-          )
+          .select("id, owner_id, name, url, status")
           .eq("id", groupId)
           .eq("owner_id", ownerId)
           .maybeSingle();
 
       if (groupError) throw groupError;
-
-      if (!group) {
-        throw new Error("Group not found");
-      }
-
+      if (!group) throw new Error("Group not found");
       if (group.status !== "active") {
         throw new Error("Group is not active");
       }
-
       if (!group.url) {
         throw new Error("Group URL is missing");
       }
 
-      /*
-       * Start the run supplied by scheduler.
-       * If no run ID was supplied, create a new run.
-       */
       if (!activeRunId) {
         const { data: newRun, error: createRunError } =
           await supabase
@@ -567,34 +516,23 @@ Deno.serve(async (req: Request) => {
             .select("id")
             .single();
 
-        if (createRunError) {
-          throw createRunError;
-        }
-
+        if (createRunError) throw createRunError;
         activeRunId = newRun.id;
       } else {
-        const { error: runStartError } =
-          await supabase
-            .from("monitoring_runs")
-            .update({
-              status: "running",
-              started_at: new Date().toISOString(),
-              finished_at: null,
-              error_message: null,
-            })
-            .eq("id", activeRunId)
-            .eq("owner_id", ownerId);
+        const { error: startError } = await supabase
+          .from("monitoring_runs")
+          .update({
+            status: "running",
+            started_at: new Date().toISOString(),
+            finished_at: null,
+            error_message: null,
+          })
+          .eq("id", activeRunId)
+          .eq("owner_id", ownerId);
 
-        if (runStartError) {
-          throw runStartError;
-        }
+        if (startError) throw startError;
       }
 
-      /*
-       * Load active keywords:
-       * - global keywords
-       * - keywords assigned to this group
-       */
       const { data: keywords, error: keywordError } =
         await supabase
           .from("keywords")
@@ -605,66 +543,39 @@ Deno.serve(async (req: Request) => {
             `group_id.is.null,group_id.eq.${groupId}`
           );
 
-      if (keywordError) {
-        throw keywordError;
-      }
+      if (keywordError) throw keywordError;
 
       const activeKeywords = (keywords ?? []).filter(
         (item: any) => item.keyword?.trim()
       );
 
-      const intervalHours = Math.max(
-        1,
-        Math.min(
-          24,
-          Number(job.interval_hours) || 6
-        )
+      /*
+       * نافذة ثابتة متحركة:
+       * من الآن ناقص 9 ساعات إلى الآن.
+       *
+       * لا نعتمد على آخر تشغيل ناجح.
+       */
+      const windowEnd = new Date();
+      const windowStart = new Date(
+        windowEnd.getTime() -
+          LOOKBACK_HOURS * 60 * 60 * 1000
       );
 
-      /*
-       * Checkpoint:
-       * Use the last successful run, not the last attempted run.
-       * Two-minute overlap protects boundary posts.
-       */
-      const {
-        data: previousSuccessfulRun,
-        error: checkpointError,
-      } = await supabase
-        .from("monitoring_runs")
-        .select("finished_at")
-        .eq("job_id", jobId)
-        .eq("owner_id", ownerId)
-        .eq("status", "success")
-        .not("finished_at", "is", null)
-        .order("finished_at", {
-          ascending: false,
-        })
-        .limit(1)
-        .maybeSingle();
+      const afterTime = windowStart.toISOString();
+      const beforeTime = windowEnd.toISOString();
 
-      if (checkpointError) {
-        throw checkpointError;
-      }
+      console.log("Monitoring time window", {
+        job_id: jobId,
+        group_id: groupId,
+        lookback_hours: LOOKBACK_HOURS,
+        after_time: afterTime,
+        before_time: beforeTime,
+      });
 
-      const afterTime =
-        previousSuccessfulRun?.finished_at
-          ? new Date(
-              new Date(
-                previousSuccessfulRun.finished_at
-              ).getTime() -
-                CHECKPOINT_OVERLAP_MS
-            ).toISOString()
-          : new Date(
-              Date.now() -
-                intervalHours * 60 * 60 * 1000
-            ).toISOString();
-
-      /*
-       * Fetch all pages, not only the first 9 posts.
-       */
       const fetchResult = await fetchAllGroupPosts(
         group.url,
         afterTime,
+        beforeTime,
         socialApiToken
       );
 
@@ -673,9 +584,6 @@ Deno.serve(async (req: Request) => {
       let matchesFound = 0;
       let skippedPosts = 0;
 
-      /*
-       * Process every unique post returned by pagination.
-       */
       for (const rawPost of posts) {
         const post = extractPost(rawPost);
 
@@ -696,43 +604,35 @@ Deno.serve(async (req: Request) => {
           )
           .map((item: any) => item.keyword);
 
-        if (matchedTerms.length === 0) {
-          continue;
-        }
+        if (matchedTerms.length === 0) continue;
 
         matchesFound++;
 
-        const { error: insertError } =
-          await supabase
-            .from("detected_items")
-            .upsert(
-              {
-                owner_id: ownerId,
-                group_id: groupId,
-                run_id: activeRunId,
-                external_id: post.id,
-                content_type: "post",
-                content: post.content,
-                source_url: post.url,
-                matched_terms: matchedTerms,
-                detected_at: new Date().toISOString(),
-                notification_sent: false,
-              },
-              {
-                onConflict:
-                  "owner_id,group_id,external_id",
-                ignoreDuplicates: true,
-              }
-            );
+        const { error: insertError } = await supabase
+          .from("detected_items")
+          .upsert(
+            {
+              owner_id: ownerId,
+              group_id: groupId,
+              run_id: activeRunId,
+              external_id: post.id,
+              content_type: "post",
+              content: post.content,
+              source_url: post.url,
+              matched_terms: matchedTerms,
+              detected_at: new Date().toISOString(),
+              notification_sent: false,
+            },
+            {
+              onConflict:
+                "owner_id,group_id,external_id",
+              ignoreDuplicates: true,
+            }
+          );
 
-        if (insertError) {
-          throw insertError;
-        }
+        if (insertError) throw insertError;
       }
 
-      /*
-       * Retry notifications for pending detected items.
-       */
       const notificationSummary =
         await retryPendingNotifications(
           supabase,
@@ -740,13 +640,8 @@ Deno.serve(async (req: Request) => {
           groupId
         );
 
-      const finishedAt =
-        new Date().toISOString();
+      const finishedAt = new Date().toISOString();
 
-      /*
-       * Mark this run successful only after all pages
-       * and all database operations have completed.
-       */
       const { error: finishRunError } =
         await supabase
           .from("monitoring_runs")
@@ -761,9 +656,7 @@ Deno.serve(async (req: Request) => {
           .eq("id", activeRunId)
           .eq("owner_id", ownerId);
 
-      if (finishRunError) {
-        throw finishRunError;
-      }
+      if (finishRunError) throw finishRunError;
 
       const { error: finishJobError } =
         await supabase
@@ -776,9 +669,7 @@ Deno.serve(async (req: Request) => {
           .eq("id", jobId)
           .eq("owner_id", ownerId);
 
-      if (finishJobError) {
-        throw finishJobError;
-      }
+      if (finishJobError) throw finishJobError;
 
       results.push({
         job_id: jobId,
@@ -794,7 +685,9 @@ Deno.serve(async (req: Request) => {
           notificationSummary.created,
         notifications_already_existing:
           notificationSummary.already_existing,
-        checkpoint: afterTime,
+        lookback_hours: LOOKBACK_HOURS,
+        after_time: afterTime,
+        before_time: beforeTime,
       });
 
     } catch (error) {
@@ -803,14 +696,11 @@ Deno.serve(async (req: Request) => {
           ? error.message
           : String(error);
 
-      console.error(
-        "Monitoring job failed:",
-        {
-          job_id: jobId,
-          run_id: activeRunId,
-          error: message,
-        }
-      );
+      console.error("Monitoring job failed:", {
+        job_id: jobId,
+        run_id: activeRunId,
+        error: message,
+      });
 
       if (activeRunId && ownerId) {
         await supabase
@@ -818,10 +708,7 @@ Deno.serve(async (req: Request) => {
           .update({
             finished_at: new Date().toISOString(),
             status: "failed",
-            error_message: message.slice(
-              0,
-              2000
-            ),
+            error_message: message.slice(0, 2000),
           })
           .eq("id", activeRunId)
           .eq("owner_id", ownerId);
@@ -832,10 +719,7 @@ Deno.serve(async (req: Request) => {
           .from("monitoring_jobs")
           .update({
             last_status: "pending",
-            last_error: message.slice(
-              0,
-              2000
-            ),
+            last_error: message.slice(0, 2000),
           })
           .eq("id", jobId)
           .eq("owner_id", ownerId);
@@ -853,8 +737,7 @@ Deno.serve(async (req: Request) => {
     (item) => item.success
   ).length;
 
-  const failed =
-    results.length - succeeded;
+  const failed = results.length - succeeded;
 
   return json({
     success: failed === 0,
