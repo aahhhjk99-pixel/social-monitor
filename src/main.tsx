@@ -8,6 +8,21 @@ import App from "./App";
 
 import "./styles.css";
 
+// Register Service Worker for Web Push
+if ("serviceWorker" in navigator && import.meta.env.PROD) {
+  window.addEventListener("load", () => {
+    const basePath = import.meta.env.BASE_URL;
+
+    navigator.serviceWorker
+      .register(`${basePath}sw.js`, {
+        scope: basePath
+      })
+      .catch((error) => {
+        console.error("[Service Worker] Registration failed:", error);
+      });
+  });
+}
+
 const rootElement = document.getElementById("root");
 
 if (!rootElement) {
