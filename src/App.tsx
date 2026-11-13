@@ -15,7 +15,7 @@ import Notifications from "./pages/Notifications";
 import Settings from "./pages/Settings";
 import Monitoring from "./pages/Monitoring";
 import Analytics from "./pages/Analytics";
-import Placeholder from "./pages/Placeholder";
+import Sources from "./pages/Sources";
 
 function Protected({
   children
@@ -52,7 +52,6 @@ export default function App() {
 
   return (
     <Routes>
-      {/* تسجيل الدخول */}
       <Route
         path="/login"
         element={
@@ -60,7 +59,6 @@ export default function App() {
         }
       />
 
-      {/* الصفحات المحمية */}
       <Route
         path="/"
         element={
@@ -69,16 +67,13 @@ export default function App() {
           </Protected>
         }
       >
-        {/* الرئيسية */}
         <Route index element={<Dashboard />} />
 
-        {/* المراقبة */}
         <Route
           path="monitoring"
           element={<Monitoring />}
         />
 
-        {/* المجموعات */}
         <Route
           path="groups"
           element={<Groups />}
@@ -89,49 +84,37 @@ export default function App() {
           element={<GroupDetail />}
         />
 
-        {/* المنشورات والتنبيهات */}
         <Route
           path="mentions"
           element={<Mentions />}
         />
 
-        {/* الكلمات المفتاحية */}
         <Route
           path="keywords"
           element={<Keywords />}
         />
 
-        {/* الإشعارات */}
         <Route
           path="notifications"
           element={<Notifications />}
         />
 
-        {/* التحليلات الفعلية */}
         <Route
           path="analytics"
           element={<Analytics />}
         />
 
-        {/* مصادر البيانات */}
         <Route
           path="sources"
-          element={
-            <Placeholder
-              title="مصادر البيانات"
-              description="إدارة موصلات البيانات المصرح بها."
-            />
-          }
+          element={<Sources />}
         />
 
-        {/* الإعدادات */}
         <Route
           path="settings"
           element={<Settings />}
         />
       </Route>
 
-      {/* أي مسار غير معروف */}
       <Route
         path="*"
         element={<Navigate to="/" replace />}
