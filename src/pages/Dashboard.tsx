@@ -1,3 +1,4 @@
+
 import { useEffect, useState } from "react";
 
 import {
@@ -18,7 +19,7 @@ import {
   listMentions
 } from "../lib/data";
 
-import { supabaseReady } from "../lib/supabase";
+import { supabase, supabaseReady } from "../lib/supabase";
 
 import type {
   GroupRecord,
@@ -26,12 +27,24 @@ import type {
   MentionRecord
 } from "../types";
 
+type MonitoringJob = {
+  id: string;
+  enabled: boolean;
+  last_status: string | null;
+  last_run_at: string | null;
+  last_error: string | null;
+  next_run_at: string | null;
+  interval_hours: number | null;
+};
+
 export default function Dashboard() {
   const { user } = useAuth();
 
   const [groups, setGroups] = useState<GroupRecord[]>([]);
   const [keywords, setKeywords] = useState<KeywordRecord[]>([]);
   const [mentions, setMentions] = useState<MentionRecord[]>([]);
+  const [monitoringJobs, setMonitoringJobs] = useState<MonitoringJob[]>([]);
+  const [databaseChecked, setDatabaseChecked] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
 
@@ -46,20 +59,51 @@ export default function Dashboard() {
 
       setLoading(true);
       setError("");
+      setDatabaseChecked(false);
 
       try {
-        const [groupData, keywordData, mentionData] =
-          await Promise.all([
-            listGroups(user.uid),
-            listKeywords(user.uid),
-            listMentions(user.uid)
-          ]);
+        const [
+          groupData,
+          keywordData,
+          mentionData,
+          jobsResult
+        ] = await Promise.all([
+          listGroups(user.uid),
+          listKeywords(user.uid),
+          listMentions(user.uid),
+          supabaseReady
+            ? supabase
+                .from("monitoring_jobs")
+                .select(
+                  "id, enabled, last_status, last_run_at, last_error, next_run_at, interval_hours"
+                )
+                .eq("owner_id", user.uid)
+                .order("last_run_at", { ascending: false })
+            : Promise.resolve({
+                data: null,
+                error: new Error("Supabase غير مُعد.")
+              })
+        ]);
 
         if (!active) return;
 
         setGroups(groupData);
         setKeywords(keywordData);
         setMentions(mentionData);
+
+        if (jobsResult.error) {
+          setMonitoringJobs([]);
+          setError(
+            "تعذر قراءة حالة مهام المراقبة من قاعدة البيانات: " +
+              jobsResult.error.message
+          );
+        } else {
+          setMonitoringJobs(
+            (jobsResult.data ?? []) as MonitoringJob[]
+          );
+        }
+
+        setDatabaseChecked(!jobsResult.error);
       } catch (err) {
         if (!active) return;
 
@@ -81,6 +125,56 @@ export default function Dashboard() {
       active = false;
     };
   }, [user]);
+
+  const enabledJobs = monitoringJobs.filter(
+    (job) => job.enabled
+  );
+
+  const successfulJobs = enabledJobs.filter(
+    (job) =>
+      job.last_status === "success" &&
+      Boolean(job.last_run_at) &&
+      !job.last_error
+  );
+
+  const latestSuccessfulJob = successfulJobs
+    .slice()
+    .sort(
+      (a, b) =>
+        new Date(b.last_run_at!).getTime() -
+        new Date(a.last_run_at!).getTime()
+    )[0];
+
+  const hasActiveMonitor = enabledJobs.length > 0;
+  const hasSuccessfulCheck = Boolean(latestSuccessfulJob);
+
+  const facebookStatus = !databaseChecked
+    ? "غير متحقق"
+    : hasSuccessfulCheck
+      ? "موصل عبر SocialAPIs"
+      : hasActiveMonitor
+        ? "مهمة مفعّلة، بانتظار فحص ناجح"
+        : "لا توجد مراقبة نشطة";
+
+  const cloudStatus = !databaseChecked
+    ? "تعذر التحقق"
+    : hasSuccessfulCheck
+      ? "آخر تشغيل ناجح"
+      : hasActiveMonitor
+        ? "بانتظار أول فحص ناجح"
+        : "لا توجد مهمة نشطة";
+
+  const formatDate = (value: string | null) => {
+    if (!value) return "غير متوفر";
+
+    const date = new Date(value);
+
+    if (Number.isNaN(date.getTime())) {
+      return "غير متوفر";
+    }
+
+    return date.toLocaleString("ar-LY");
+  };
 
   const today = mentions.filter((mention) => {
     return (
@@ -127,9 +221,11 @@ export default function Dashboard() {
 
         <span className="live-pill">
           <i />
-          {supabaseReady
-            ? "Supabase مُعد"
-            : "Supabase غير مُعد"}
+          {databaseChecked
+            ? "Supabase متصل"
+            : supabaseReady
+              ? "جاري التحقق من Supabase"
+              : "Supabase غير مُعد"}
         </span>
       </div>
 
@@ -178,7 +274,7 @@ export default function Dashboard() {
 
           {mentions.length === 0 ? (
             <EmptyState
-              text="لا توجد نتائج بعد. ستظهر هنا النتائج التي يضيفها مصدر بيانات مصرح به."
+              text="لا توجد نتائج بعد. ستظهر هنا النتائج التي يضيفها مصدر البيانات عند العثور على تطابق."
             />
           ) : (
             <div className="mention-list">
@@ -218,7 +314,7 @@ export default function Dashboard() {
           <div className="panel-head">
             <div>
               <h2>حالة النظام</h2>
-              <p>جاهزية مكونات المشروع</p>
+              <p>حالة الاتصال ومهام المراقبة المسجلة</p>
             </div>
 
             <Activity size={18} />
@@ -233,33 +329,82 @@ export default function Dashboard() {
           <div className="health-item">
             <span
               className={
-                supabaseReady
+                databaseChecked
                   ? "health-indicator good"
                   : "health-indicator warn"
               }
             />
             Supabase
             <b>
-              {supabaseReady ? "مُعد" : "غير مُعد"}
+              {databaseChecked
+                ? "متصل"
+                : supabaseReady
+                  ? "غير متحقق"
+                  : "غير مُعد"}
             </b>
           </div>
 
           <div className="health-item">
-            <span className="health-indicator warn" />
+            <span
+              className={
+                hasSuccessfulCheck
+                  ? "health-indicator good"
+                  : "health-indicator warn"
+              }
+            />
             مصدر Facebook
-            <b>غير مربوط</b>
+            <b>{facebookStatus}</b>
           </div>
 
           <div className="health-item">
-            <span className="health-indicator warn" />
+            <span
+              className={
+                hasSuccessfulCheck
+                  ? "health-indicator good"
+                  : "health-indicator warn"
+              }
+            />
             الفحص السحابي
-            <b>بانتظار الموصل</b>
+            <b>{cloudStatus}</b>
           </div>
 
-          <div className="notice warning compact">
-            <AlertTriangle size={15} />
-            لا توجد مراقبة حقيقية قبل ربط مصدر بيانات مصرح.
-          </div>
+          {hasSuccessfulCheck && latestSuccessfulJob && (
+            <div className="notice compact">
+              <Activity size={15} />
+              <div>
+                <b>آخر فحص ناجح</b>
+                <p>
+                  {formatDate(latestSuccessfulJob.last_run_at)}
+                </p>
+
+                <b>الفاصل بين عمليات المراقبة</b>
+                <p>
+                  {latestSuccessfulJob.interval_hours ?? "غير محدد"} ساعة
+                </p>
+
+                <b>موعد التشغيل التالي المسجل</b>
+                <p>
+                  {formatDate(latestSuccessfulJob.next_run_at)}
+                </p>
+              </div>
+            </div>
+          )}
+
+          {databaseChecked && !hasSuccessfulCheck && (
+            <div className="notice warning compact">
+              <AlertTriangle size={15} />
+              {!hasActiveMonitor
+                ? "لا توجد مهمة مراقبة مفعّلة لهذا الحساب."
+                : "توجد مهمة مراقبة مفعّلة، لكن لا يوجد تشغيل ناجح مسجل لها حتى الآن."}
+            </div>
+          )}
+
+          {!databaseChecked && !loading && (
+            <div className="notice warning compact">
+              <AlertTriangle size={15} />
+              لم نتمكن من التحقق من حالة مهام المراقبة.
+            </div>
+          )}
         </section>
       </div>
 
