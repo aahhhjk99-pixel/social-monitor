@@ -473,7 +473,7 @@ export async function listMentions(
   if (!ownerId) return [];
 
   const { data, error } = await supabase
-    .from("mentions")
+    .from("detected_items")
     .select("*")
     .eq("owner_id", ownerId)
     .order("detected_at", { ascending: false });
