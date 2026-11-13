@@ -9,9 +9,10 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-const API_PAGE_SIZE = 9;
-const LOOKBACK_HOURS = 9;
-const PAGE_TIMEOUT_MS = 20000;
+const POSTS_WINDOW_HOURS = 9;
+const POSTS_LIMIT = 9;
+const API_TIMEOUT_MS = 25_000;
+const PENDING_NOTIFICATION_LIMIT = 25;
 
 const json = (data: unknown, status = 200) =>
   new Response(JSON.stringify(data), {
@@ -24,6 +25,12 @@ const json = (data: unknown, status = 200) =>
 
 const normalize = (value: string) =>
   value.normalize("NFC").toLocaleLowerCase().trim();
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error
+    ? error.message
+    : String(error);
+}
 
 function extractPosts(payload: any): any[] {
   const candidates = [
@@ -40,29 +47,35 @@ function extractPosts(payload: any): any[] {
   return [];
 }
 
-function extractNextCursor(payload: any): string | null {
-  const candidates = [
-    payload?.page_info?.end_cursor,
-    payload?.data?.page_info?.end_cursor,
-    payload?.data?.data?.page_info?.end_cursor,
-    payload?.pagination?.end_cursor,
-    payload?.pagination?.next_cursor,
-    payload?.data?.pagination?.end_cursor,
-    payload?.data?.pagination?.next_cursor,
-    payload?.next_cursor,
-    payload?.end_cursor,
-  ];
+function parsePostDate(post: any): Date | null {
+  const raw =
+    post?.details?.created_at ??
+    post?.details?.published_at ??
+    post?.values?.created_at ??
+    post?.values?.timestamp ??
+    post?.created_at ??
+    post?.published_at ??
+    post?.timestamp ??
+    null;
 
-  for (const candidate of candidates) {
-    if (
-      typeof candidate === "string" &&
-      candidate.trim().length > 0
-    ) {
-      return candidate.trim();
+  if (raw === null || raw === undefined) return null;
+
+  let date: Date;
+
+  if (typeof raw === "number" || /^\d+$/.test(String(raw))) {
+    let value = Number(raw);
+
+    // Convert Unix seconds to milliseconds.
+    if (value > 0 && value < 10_000_000_000) {
+      value *= 1000;
     }
+
+    date = new Date(value);
+  } else {
+    date = new Date(String(raw));
   }
 
-  return null;
+  return Number.isNaN(date.getTime()) ? null : date;
 }
 
 function extractPost(post: any) {
@@ -94,21 +107,25 @@ function extractPost(post: any) {
     id: id ? String(id) : null,
     content,
     url: url ? String(url) : null,
+    createdAt: parsePostDate(post),
   };
 }
 
 async function findExistingNotification(
   supabase: any,
+  ownerId: string,
   detectedItemId: string
 ) {
   const { data, error } = await supabase
     .from("monitoring_notifications")
     .select("id")
+    .eq("owner_id", ownerId)
     .eq("detected_item_id", detectedItemId)
     .limit(1)
     .maybeSingle();
 
   if (error) throw error;
+
   return data;
 }
 
@@ -119,6 +136,7 @@ async function ensureNotification(
 ): Promise<"created" | "existing"> {
   const existing = await findExistingNotification(
     supabase,
+    ownerId,
     item.id
   );
 
@@ -135,14 +153,16 @@ async function ensureNotification(
         owner_id: ownerId,
         detected_item_id: item.id,
         title: "تم العثور على منشور مطابق",
-        message: `الكلمات المطابقة: ${terms.join("، ")}`,
+        message: `الكلمات المطابقة: ${terms.join(", ")}`,
         source_url: item.source_url ?? null,
         delivery_status: "pending",
       });
 
     if (insertError) {
+      // A concurrent request may have inserted the notification.
       const afterError = await findExistingNotification(
         supabase,
+        ownerId,
         item.id
       );
 
@@ -171,208 +191,50 @@ async function ensureNotification(
   return result;
 }
 
+/**
+ * Processes a bounded number of pending notifications per run.
+ * Remaining items are picked up by later successful runs.
+ */
 async function retryPendingNotifications(
   supabase: any,
   ownerId: string,
   groupId: string
 ) {
-  let cursor: string | null = null;
+  const { data: pendingItems, error } = await supabase
+    .from("detected_items")
+    .select("id, matched_terms, source_url")
+    .eq("owner_id", ownerId)
+    .eq("group_id", groupId)
+    .eq("notification_sent", false)
+    .order("detected_at", { ascending: true })
+    .limit(PENDING_NOTIFICATION_LIMIT);
+
+  if (error) throw error;
+
   let created = 0;
   let alreadyExisting = 0;
   let processed = 0;
 
-  while (true) {
-    let query = supabase
-      .from("detected_items")
-      .select("id, matched_terms, source_url")
-      .eq("owner_id", ownerId)
-      .eq("group_id", groupId)
-      .eq("notification_sent", false)
-      .order("id", { ascending: true })
-      .limit(500);
+  for (const item of pendingItems ?? []) {
+    const result = await ensureNotification(
+      supabase,
+      ownerId,
+      item
+    );
 
-    if (cursor) {
-      query = query.gt("id", cursor);
+    if (result === "created") {
+      created++;
+    } else {
+      alreadyExisting++;
     }
 
-    const { data, error } = await query;
-
-    if (error) throw error;
-    if (!data || data.length === 0) break;
-
-    for (const item of data) {
-      const result = await ensureNotification(
-        supabase,
-        ownerId,
-        item
-      );
-
-      if (result === "created") created++;
-      else alreadyExisting++;
-
-      processed++;
-    }
-
-    cursor = data[data.length - 1].id;
-
-    if (data.length < 500) break;
+    processed++;
   }
 
   return {
     processed,
     created,
     already_existing: alreadyExisting,
-  };
-}
-
-/**
- * يجلب المنشورات ضمن نافذة زمنية ثابتة:
- * آخر 9 ساعات فقط، وحتى وقت بداية الفحص.
- */
-async function fetchAllGroupPosts(
-  groupUrl: string,
-  afterTime: string,
-  beforeTime: string,
-  socialApiToken: string
-) {
-  const posts: any[] = [];
-  const seenCursors = new Set<string>();
-  const seenPostIds = new Set<string>();
-
-  let nextCursor: string | null = null;
-  let pageCount = 0;
-  let duplicatePosts = 0;
-
-  while (true) {
-    pageCount++;
-
-    const apiUrl = new URL(
-      "https://api.socialapis.io/facebook/groups/posts"
-    );
-
-    apiUrl.searchParams.set("link", groupUrl);
-    apiUrl.searchParams.set("limit", String(API_PAGE_SIZE));
-    apiUrl.searchParams.set("timezone", "UTC");
-    apiUrl.searchParams.set("after_time", afterTime);
-    apiUrl.searchParams.set("before_time", beforeTime);
-
-    if (nextCursor) {
-      apiUrl.searchParams.set("end_cursor", nextCursor);
-    }
-
-    const controller = new AbortController();
-
-    const timeout = setTimeout(
-      () => controller.abort(),
-      PAGE_TIMEOUT_MS
-    );
-
-    let response: Response;
-    let responseText: string;
-
-    try {
-      response = await fetch(apiUrl.toString(), {
-        method: "GET",
-        headers: {
-          "x-api-token": socialApiToken,
-          Accept: "application/json",
-        },
-        signal: controller.signal,
-      });
-
-      responseText = await response.text();
-    } catch (error) {
-      if (
-        error instanceof Error &&
-        error.name === "AbortError"
-      ) {
-        throw new Error(
-          `SocialAPIs request timed out on page ${pageCount}`
-        );
-      }
-
-      throw error;
-    } finally {
-      clearTimeout(timeout);
-    }
-
-    if (!response.ok) {
-      throw new Error(
-        `SocialAPIs HTTP ${response.status}: ${responseText.slice(0, 500)}`
-      );
-    }
-
-    let apiData: any;
-
-    try {
-      apiData = JSON.parse(responseText);
-    } catch {
-      throw new Error("SocialAPIs returned invalid JSON");
-    }
-
-    if (apiData?.success === false || apiData?.error) {
-      throw new Error(
-        String(
-          apiData?.message ??
-          apiData?.error ??
-          "SocialAPIs API error"
-        )
-      );
-    }
-
-    const pagePosts = extractPosts(apiData);
-
-    for (const rawPost of pagePosts) {
-      const post = extractPost(rawPost);
-
-      if (post.id && seenPostIds.has(post.id)) {
-        duplicatePosts++;
-        continue;
-      }
-
-      if (post.id) seenPostIds.add(post.id);
-      posts.push(rawPost);
-    }
-
-    const returnedCursor = extractNextCursor(apiData);
-
-    if (
-      returnedCursor &&
-      seenCursors.has(returnedCursor)
-    ) {
-      throw new Error(
-        "SocialAPIs returned a repeated pagination cursor."
-      );
-    }
-
-    if (returnedCursor) {
-      seenCursors.add(returnedCursor);
-    }
-
-    if (returnedCursor && pagePosts.length === 0) {
-      throw new Error(
-        "SocialAPIs returned a next-page cursor with an empty posts page."
-      );
-    }
-
-    console.log("SocialAPIs page completed", {
-      page: pageCount,
-      page_posts: pagePosts.length,
-      total_unique_posts: posts.length,
-      has_next_page: Boolean(returnedCursor),
-      after_time: afterTime,
-      before_time: beforeTime,
-    });
-
-    if (!returnedCursor) break;
-
-    nextCursor = returnedCursor;
-  }
-
-  return {
-    posts,
-    pages_fetched: pageCount,
-    duplicate_posts: duplicatePosts,
   };
 }
 
@@ -385,22 +247,14 @@ Deno.serve(async (req: Request) => {
 
   if (req.method !== "POST") {
     return json(
-      {
-        success: false,
-        error: "Method not allowed",
-        allowed_methods: ["POST", "OPTIONS"],
-      },
+      { success: false, error: "Method not allowed" },
       405
     );
   }
 
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
-  const serviceKey = Deno.env.get(
-    "SUPABASE_SERVICE_ROLE_KEY"
-  );
-  const socialApiToken = Deno.env.get(
-    "SOCIALAPIS_API_TOKEN"
-  );
+  const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const socialApiToken = Deno.env.get("SOCIALAPIS_API_TOKEN");
 
   if (!supabaseUrl || !serviceKey || !socialApiToken) {
     return json(
@@ -412,19 +266,14 @@ Deno.serve(async (req: Request) => {
     );
   }
 
-  const authorization =
-    req.headers.get("Authorization") ?? "";
-
+  const authorization = req.headers.get("Authorization") ?? "";
   const bearer = authorization
     .replace(/^Bearer\s+/i, "")
     .trim();
 
   if (!bearer || bearer !== serviceKey) {
     return json(
-      {
-        success: false,
-        error: "Unauthorized",
-      },
+      { success: false, error: "Unauthorized" },
       401
     );
   }
@@ -446,10 +295,7 @@ Deno.serve(async (req: Request) => {
     body = await req.json();
   } catch {
     return json(
-      {
-        success: false,
-        error: "Invalid JSON body",
-      },
+      { success: false, error: "Invalid JSON body" },
       400
     );
   }
@@ -477,7 +323,7 @@ Deno.serve(async (req: Request) => {
     let activeRunId = runId;
 
     try {
-      if (!jobId || !ownerId || !groupId) {
+      if (!jobId || !ownerId || !groupId || !runId) {
         throw new Error(
           "Job is missing required identifiers"
         );
@@ -493,44 +339,13 @@ Deno.serve(async (req: Request) => {
 
       if (groupError) throw groupError;
       if (!group) throw new Error("Group not found");
+
       if (group.status !== "active") {
         throw new Error("Group is not active");
       }
+
       if (!group.url) {
         throw new Error("Group URL is missing");
-      }
-
-      if (!activeRunId) {
-        const { data: newRun, error: createRunError } =
-          await supabase
-            .from("monitoring_runs")
-            .insert({
-              owner_id: ownerId,
-              job_id: jobId,
-              started_at: new Date().toISOString(),
-              status: "running",
-              posts_checked: 0,
-              comments_checked: 0,
-              matches_found: 0,
-            })
-            .select("id")
-            .single();
-
-        if (createRunError) throw createRunError;
-        activeRunId = newRun.id;
-      } else {
-        const { error: startError } = await supabase
-          .from("monitoring_runs")
-          .update({
-            status: "running",
-            started_at: new Date().toISOString(),
-            finished_at: null,
-            error_message: null,
-          })
-          .eq("id", activeRunId)
-          .eq("owner_id", ownerId);
-
-        if (startError) throw startError;
       }
 
       const { data: keywords, error: keywordError } =
@@ -539,56 +354,99 @@ Deno.serve(async (req: Request) => {
           .select("id, keyword, priority")
           .eq("owner_id", ownerId)
           .eq("is_active", true)
-          .or(
-            `group_id.is.null,group_id.eq.${groupId}`
-          );
+          .or(`group_id.is.null,group_id.eq.${groupId}`);
 
       if (keywordError) throw keywordError;
 
       const activeKeywords = (keywords ?? []).filter(
-        (item: any) => item.keyword?.trim()
+        (item: any) =>
+          typeof item.keyword === "string" &&
+          item.keyword.trim().length > 0
       );
 
-      /*
-       * نافذة ثابتة متحركة:
-       * من الآن ناقص 9 ساعات إلى الآن.
-       *
-       * لا نعتمد على آخر تشغيل ناجح.
-       */
-      const windowEnd = new Date();
-      const windowStart = new Date(
-        windowEnd.getTime() -
-          LOOKBACK_HOURS * 60 * 60 * 1000
+      // Always use the last 9 hours, not interval_hours.
+      const afterTime = new Date(
+        Date.now() -
+        POSTS_WINDOW_HOURS * 60 * 60 * 1000
       );
 
-      const afterTime = windowStart.toISOString();
-      const beforeTime = windowEnd.toISOString();
-
-      console.log("Monitoring time window", {
-        job_id: jobId,
-        group_id: groupId,
-        lookback_hours: LOOKBACK_HOURS,
-        after_time: afterTime,
-        before_time: beforeTime,
-      });
-
-      const fetchResult = await fetchAllGroupPosts(
-        group.url,
-        afterTime,
-        beforeTime,
-        socialApiToken
+      const apiUrl = new URL(
+        "https://api.socialapis.io/facebook/groups/posts"
       );
 
-      const posts = fetchResult.posts;
+      apiUrl.searchParams.set("link", group.url);
+      apiUrl.searchParams.set("limit", String(POSTS_LIMIT));
+      apiUrl.searchParams.set("timezone", "UTC");
+      apiUrl.searchParams.set(
+        "after_time",
+        afterTime.toISOString()
+      );
+
+      const apiResponse = await fetch(
+        apiUrl.toString(),
+        {
+          method: "GET",
+          headers: {
+            "x-api-token": socialApiToken,
+            "Accept": "application/json",
+          },
+          signal: AbortSignal.timeout(API_TIMEOUT_MS),
+        }
+      );
+
+      const responseText = await apiResponse.text();
+
+      if (!apiResponse.ok) {
+        throw new Error(
+          `SocialAPIs HTTP ${apiResponse.status}: ${responseText.slice(0, 500)}`
+        );
+      }
+
+      let apiData: any;
+
+      try {
+        apiData = JSON.parse(responseText);
+      } catch {
+        throw new Error(
+          "SocialAPIs returned invalid JSON"
+        );
+      }
+
+      if (
+        apiData?.success === false ||
+        apiData?.error
+      ) {
+        throw new Error(
+          String(
+            apiData?.message ??
+            apiData?.error ??
+            "SocialAPIs API error"
+          )
+        );
+      }
+
+      const posts = extractPosts(apiData);
 
       let matchesFound = 0;
       let skippedPosts = 0;
+      let oldPostsSkipped = 0;
+      let newItemsSaved = 0;
 
       for (const rawPost of posts) {
         const post = extractPost(rawPost);
 
         if (!post.id || !post.content) {
           skippedPosts++;
+          continue;
+        }
+
+        // If the API supplies a usable post date, enforce the window again.
+        // If it does not, rely on SocialAPIs after_time filtering.
+        if (
+          post.createdAt &&
+          post.createdAt.getTime() < afterTime.getTime()
+        ) {
+          oldPostsSkipped++;
           continue;
         }
 
@@ -604,35 +462,42 @@ Deno.serve(async (req: Request) => {
           )
           .map((item: any) => item.keyword);
 
-        if (matchedTerms.length === 0) continue;
+        if (matchedTerms.length === 0) {
+          continue;
+        }
 
         matchesFound++;
 
-        const { error: insertError } = await supabase
-          .from("detected_items")
-          .upsert(
-            {
-              owner_id: ownerId,
-              group_id: groupId,
-              run_id: activeRunId,
-              external_id: post.id,
-              content_type: "post",
-              content: post.content,
-              source_url: post.url,
-              matched_terms: matchedTerms,
-              detected_at: new Date().toISOString(),
-              notification_sent: false,
-            },
-            {
-              onConflict:
-                "owner_id,group_id,external_id",
-              ignoreDuplicates: true,
-            }
-          );
+        const { data: savedItems, error: insertError } =
+          await supabase
+            .from("detected_items")
+            .upsert(
+              {
+                owner_id: ownerId,
+                group_id: groupId,
+                run_id: activeRunId,
+                external_id: post.id,
+                content_type: "post",
+                content: post.content,
+                source_url: post.url,
+                matched_terms: matchedTerms,
+                detected_at: new Date().toISOString(),
+              },
+              {
+                onConflict: "owner_id,group_id,external_id",
+                ignoreDuplicates: true,
+              }
+            )
+            .select("id");
 
         if (insertError) throw insertError;
+
+        if (savedItems?.length) {
+          newItemsSaved += savedItems.length;
+        }
       }
 
+      // Retry only a bounded number of old pending notifications.
       const notificationSummary =
         await retryPendingNotifications(
           supabase,
@@ -674,27 +539,20 @@ Deno.serve(async (req: Request) => {
       results.push({
         job_id: jobId,
         success: true,
-        pages_fetched: fetchResult.pages_fetched,
         posts_checked: posts.length,
-        duplicate_posts: fetchResult.duplicate_posts,
         skipped_posts: skippedPosts,
+        old_posts_skipped: oldPostsSkipped,
         matches_found: matchesFound,
+        new_items_saved: newItemsSaved,
         notifications_processed:
           notificationSummary.processed,
         notifications_created:
           notificationSummary.created,
         notifications_already_existing:
           notificationSummary.already_existing,
-        lookback_hours: LOOKBACK_HOURS,
-        after_time: afterTime,
-        before_time: beforeTime,
       });
-
     } catch (error) {
-      const message =
-        error instanceof Error
-          ? error.message
-          : String(error);
+      const message = errorMessage(error);
 
       console.error("Monitoring job failed:", {
         job_id: jobId,
@@ -702,31 +560,53 @@ Deno.serve(async (req: Request) => {
         error: message,
       });
 
+      const retryAt = new Date(
+        Date.now() + 5 * 60 * 1000
+      ).toISOString();
+
       if (activeRunId && ownerId) {
-        await supabase
-          .from("monitoring_runs")
-          .update({
-            finished_at: new Date().toISOString(),
-            status: "failed",
-            error_message: message.slice(0, 2000),
-          })
-          .eq("id", activeRunId)
-          .eq("owner_id", ownerId);
+        const { error: runUpdateError } =
+          await supabase
+            .from("monitoring_runs")
+            .update({
+              finished_at: new Date().toISOString(),
+              status: "failed",
+              error_message: message.slice(0, 2000),
+            })
+            .eq("id", activeRunId)
+            .eq("owner_id", ownerId);
+
+        if (runUpdateError) {
+          console.error(
+            "Could not update failed run:",
+            runUpdateError
+          );
+        }
       }
 
       if (jobId && ownerId) {
-        await supabase
-          .from("monitoring_jobs")
-          .update({
-            last_status: "pending",
-            last_error: message.slice(0, 2000),
-          })
-          .eq("id", jobId)
-          .eq("owner_id", ownerId);
+        const { error: jobUpdateError } =
+          await supabase
+            .from("monitoring_jobs")
+            .update({
+              last_status: "pending",
+              last_error: message.slice(0, 1000),
+              next_run_at: retryAt,
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", jobId)
+            .eq("owner_id", ownerId);
+
+        if (jobUpdateError) {
+          console.error(
+            "Could not schedule job retry:",
+            jobUpdateError
+          );
+        }
       }
 
       results.push({
-        job_id: jobId ?? null,
+        job_id: jobId,
         success: false,
         error: message,
       });
@@ -745,5 +625,6 @@ Deno.serve(async (req: Request) => {
     succeeded,
     failed,
     results,
+    timestamp: new Date().toISOString(),
   });
 });
