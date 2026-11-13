@@ -10,6 +10,7 @@ import Groups from "./pages/Groups";
 import GroupDetail from "./pages/GroupDetail";
 import Keywords from "./pages/Keywords";
 import Mentions from "./pages/Mentions";
+import Notifications from "./pages/Notifications";
 import Settings from "./pages/Settings";
 import Monitoring from "./pages/Monitoring";
 import Placeholder from "./pages/Placeholder";
@@ -84,12 +85,7 @@ export default function App() {
 
         <Route
           path="notifications"
-          element={
-            <Placeholder
-              title="الإشعارات"
-              description="سجل التنبيهات وإعدادات Web Push."
-            />
-          }
+          element={<Notifications />}
         />
 
         <Route
