@@ -1,7 +1,7 @@
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useAuth } from "../auth/AuthContext";
-import { supabaseReady } from "../lib/supabase";
+import { supabase, supabaseReady } from "../lib/supabase";
 import { subscribeToPush } from "../lib/pushNotifications";
 
 import {
@@ -14,15 +14,87 @@ export default function Settings() {
   const { user } = useAuth();
 
   const [pushLoading, setPushLoading] = useState(false);
+  const [pushChecking, setPushChecking] = useState(true);
   const [pushStatus, setPushStatus] = useState("");
-  const [pushEnabled, setPushEnabled] = useState(
-    typeof Notification !== "undefined" &&
-    Notification.permission === "granted"
-  );
+  const [pushEnabled, setPushEnabled] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+
+    async function checkPushSubscription() {
+      setPushChecking(true);
+
+      try {
+        if (
+          !user?.uid ||
+          !supabaseReady ||
+          !("serviceWorker" in navigator) ||
+          !("PushManager" in window) ||
+          !("Notification" in window)
+        ) {
+          if (active) setPushEnabled(false);
+          return;
+        }
+
+        // إذن المتصفح وحده لا يعني وجود اشتراك.
+        if (Notification.permission !== "granted") {
+          if (active) setPushEnabled(false);
+          return;
+        }
+
+        const registration = await navigator.serviceWorker.ready;
+        const subscription =
+          await registration.pushManager.getSubscription();
+
+        if (!subscription) {
+          if (active) setPushEnabled(false);
+          return;
+        }
+
+        // التأكد من أن الاشتراك محفوظ فعلياً في قاعدة البيانات.
+        const { data, error } = await supabase
+          .from("push_subscriptions")
+          .select("id")
+          .eq("user_id", user.uid)
+          .eq("endpoint", subscription.endpoint)
+          .maybeSingle();
+
+        if (error) throw error;
+
+        if (active) {
+          setPushEnabled(Boolean(data));
+        }
+      } catch (error) {
+        console.error(
+          "[Web Push] Subscription check failed:",
+          error
+        );
+
+        if (active) {
+          setPushEnabled(false);
+        }
+      } finally {
+        if (active) {
+          setPushChecking(false);
+        }
+      }
+    }
+
+    checkPushSubscription();
+
+    return () => {
+      active = false;
+    };
+  }, [user?.uid]);
 
   async function handleEnablePush() {
     if (!user?.uid) {
       setPushStatus("يجب تسجيل الدخول أولاً.");
+      return;
+    }
+
+    if (!supabaseReady) {
+      setPushStatus("إعدادات الاتصال بقاعدة البيانات غير مكتملة.");
       return;
     }
 
@@ -31,9 +103,42 @@ export default function Settings() {
 
     try {
       await subscribeToPush(user.uid);
+
+      // إعادة التحقق من الاشتراك بعد الحفظ.
+      const registration = await navigator.serviceWorker.ready;
+      const subscription =
+        await registration.pushManager.getSubscription();
+
+      if (!subscription) {
+        throw new Error(
+          "لم يتم العثور على اشتراك المتصفح بعد عملية التفعيل."
+        );
+      }
+
+      const { data, error } = await supabase
+        .from("push_subscriptions")
+        .select("id")
+        .eq("user_id", user.uid)
+        .eq("endpoint", subscription.endpoint)
+        .maybeSingle();
+
+      if (error) throw error;
+
+      if (!data) {
+        throw new Error(
+          "لم يتم تأكيد حفظ الاشتراك في قاعدة البيانات."
+        );
+      }
+
       setPushEnabled(true);
-      setPushStatus("تم تفعيل اشتراك إشعارات المتصفح بنجاح.");
+      setPushStatus(
+        "تم تفعيل اشتراك إشعارات المتصفح وحفظه بنجاح."
+      );
     } catch (error) {
+      console.error("[Web Push] Activation failed:", error);
+
+      setPushEnabled(false);
+
       setPushStatus(
         error instanceof Error
           ? error.message
@@ -105,20 +210,34 @@ export default function Settings() {
 
         <div className="setting-row">
           <span>إشعارات المتصفح</span>
-          <b className={pushEnabled ? "good-text" : "warn-text"}>
-            {pushEnabled ? "تم منح إذن الإشعارات" : "غير مفعّلة"}
+          <b
+            className={
+              pushChecking
+                ? ""
+                : pushEnabled
+                  ? "good-text"
+                  : "warn-text"
+            }
+          >
+            {pushChecking
+              ? "جارٍ التحقق..."
+              : pushEnabled
+                ? "الاشتراك محفوظ ومفعّل"
+                : Notification.permission === "granted"
+                  ? "الإذن ممنوح، الاشتراك غير مكتمل"
+                  : "غير مفعّلة"}
           </b>
         </div>
 
         <button
           type="button"
           onClick={handleEnablePush}
-          disabled={pushLoading || pushEnabled}
+          disabled={pushLoading || pushChecking || pushEnabled}
         >
           {pushLoading
-            ? "جارٍ التفعيل..."
+            ? "جارٍ تفعيل الاشتراك..."
             : pushEnabled
-              ? "الإشعارات مفعّلة"
+              ? "الاشتراك مفعّل"
               : "تفعيل إشعارات المتصفح"}
         </button>
 
