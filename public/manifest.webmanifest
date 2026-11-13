@@ -2,8 +2,8 @@
 {
   "id": "/social-monitor/",
   "name": "Social Monitor",
-  "short_name": "Social Monitor",
-  "description": "منصة مراقبة وتحليل الإشارات العامة",
+  "short_name": "Monitor",
+  "description": "منصة مراقبة وتحليل المنشورات والإشارات العامة",
   "lang": "ar",
   "dir": "rtl",
   "start_url": "/social-monitor/",
@@ -19,5 +19,13 @@
   "categories": [
     "productivity",
     "utilities"
+  ],
+  "icons": [
+    {
+      "src": "/social-monitor/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
   ]
 }
