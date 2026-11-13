@@ -1,4 +1,3 @@
-
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
 
@@ -12,7 +11,10 @@ const corsHeaders = {
 const json = (data: unknown, status = 200) =>
   new Response(JSON.stringify(data), {
     status,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
+    headers: {
+      ...corsHeaders,
+      "Content-Type": "application/json",
+    },
   });
 
 const normalize = (value: string) =>
@@ -69,7 +71,9 @@ function extractPost(post: any) {
     id: id ? String(id) : null,
     content,
     url: url ? String(url) : null,
-    commentsCount: Number.isFinite(commentsCount) ? commentsCount : 0,
+    commentsCount: Number.isFinite(commentsCount)
+      ? commentsCount
+      : 0,
   };
 }
 
@@ -79,7 +83,10 @@ Deno.serve(async (req: Request) => {
   }
 
   if (req.method !== "POST") {
-    return json({ success: false, error: "Method not allowed" }, 405);
+    return json(
+      { success: false, error: "Method not allowed" },
+      405
+    );
   }
 
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
@@ -97,7 +104,10 @@ Deno.serve(async (req: Request) => {
   const bearer = authorization.replace(/^Bearer\s+/i, "").trim();
 
   if (!bearer || bearer !== serviceKey) {
-    return json({ success: false, error: "Unauthorized" }, 401);
+    return json(
+      { success: false, error: "Unauthorized" },
+      401
+    );
   }
 
   const supabase = createClient(supabaseUrl, serviceKey, {
@@ -112,7 +122,10 @@ Deno.serve(async (req: Request) => {
   try {
     body = await req.json();
   } catch {
-    return json({ success: false, error: "Invalid JSON body" }, 400);
+    return json(
+      { success: false, error: "Invalid JSON body" },
+      400
+    );
   }
 
   const jobs = Array.isArray(body?.jobs) ? body.jobs : [];
@@ -152,22 +165,25 @@ Deno.serve(async (req: Request) => {
       if (group.status !== "active") {
         throw new Error("Group is not active");
       }
-      if (!group.url) throw new Error("Group URL is missing");
+      if (!group.url) {
+        throw new Error("Group URL is missing");
+      }
 
       if (!activeRunId) {
-        const { data: newRun, error: createRunError } = await supabase
-          .from("monitoring_runs")
-          .insert({
-            owner_id: ownerId,
-            job_id: jobId,
-            started_at: new Date().toISOString(),
-            status: "running",
-            posts_checked: 0,
-            comments_checked: 0,
-            matches_found: 0,
-          })
-          .select("id")
-          .single();
+        const { data: newRun, error: createRunError } =
+          await supabase
+            .from("monitoring_runs")
+            .insert({
+              owner_id: ownerId,
+              job_id: jobId,
+              started_at: new Date().toISOString(),
+              status: "running",
+              posts_checked: 0,
+              comments_checked: 0,
+              matches_found: 0,
+            })
+            .select("id")
+            .single();
 
         if (createRunError) throw createRunError;
         activeRunId = newRun.id;
@@ -177,6 +193,7 @@ Deno.serve(async (req: Request) => {
           .update({
             status: "running",
             started_at: new Date().toISOString(),
+            finished_at: null,
             error_message: null,
           })
           .eq("id", activeRunId)
@@ -185,12 +202,13 @@ Deno.serve(async (req: Request) => {
         if (runStartError) throw runStartError;
       }
 
-      const { data: keywords, error: keywordError } = await supabase
-        .from("keywords")
-        .select("id, keyword, priority")
-        .eq("owner_id", ownerId)
-        .eq("is_active", true)
-        .or(`group_id.is.null,group_id.eq.${groupId}`);
+      const { data: keywords, error: keywordError } =
+        await supabase
+          .from("keywords")
+          .select("id, keyword, priority")
+          .eq("owner_id", ownerId)
+          .eq("is_active", true)
+          .or(`group_id.is.null,group_id.eq.${groupId}`);
 
       if (keywordError) throw keywordError;
 
@@ -212,7 +230,10 @@ Deno.serve(async (req: Request) => {
       );
 
       apiUrl.searchParams.set("link", group.url);
-      apiUrl.searchParams.set("limit", "50");
+
+      // SocialAPIs accepts a maximum limit of 9.
+      apiUrl.searchParams.set("limit", "9");
+
       apiUrl.searchParams.set("timezone", "UTC");
       apiUrl.searchParams.set("after_time", afterTime);
 
@@ -240,13 +261,21 @@ Deno.serve(async (req: Request) => {
         throw new Error("SocialAPIs returned invalid JSON");
       }
 
-      if (apiData?.success === false || apiData?.error) {
+      if (
+        apiData?.success === false ||
+        apiData?.error
+      ) {
         throw new Error(
-          String(apiData?.message ?? apiData?.error ?? "SocialAPIs API error")
+          String(
+            apiData?.message ??
+            apiData?.error ??
+            "SocialAPIs API error"
+          )
         );
       }
 
       const posts = extractPosts(apiData);
+
       let matchesFound = 0;
       let notificationsCreated = 0;
       let skippedPosts = 0;
@@ -263,7 +292,9 @@ Deno.serve(async (req: Request) => {
 
         const matchedTerms = activeKeywords
           .filter((item: any) =>
-            normalizedContent.includes(normalize(item.keyword))
+            normalizedContent.includes(
+              normalize(item.keyword)
+            )
           )
           .map((item: any) => item.keyword);
 
@@ -271,32 +302,35 @@ Deno.serve(async (req: Request) => {
 
         matchesFound++;
 
-        const { data: insertedItems, error: insertError } = await supabase
-          .from("detected_items")
-          .upsert(
-            {
-              owner_id: ownerId,
-              group_id: groupId,
-              run_id: activeRunId,
-              external_id: post.id,
-              content_type: "post",
-              content: post.content,
-              source_url: post.url,
-              matched_terms: matchedTerms,
-              detected_at: new Date().toISOString(),
-              notification_sent: false,
-            },
-            {
-              onConflict: "owner_id,group_id,external_id",
-              ignoreDuplicates: true,
-            }
-          )
-          .select("id");
+        const { data: insertedItems, error: insertError } =
+          await supabase
+            .from("detected_items")
+            .upsert(
+              {
+                owner_id: ownerId,
+                group_id: groupId,
+                run_id: activeRunId,
+                external_id: post.id,
+                content_type: "post",
+                content: post.content,
+                source_url: post.url,
+                matched_terms: matchedTerms,
+                detected_at: new Date().toISOString(),
+                notification_sent: false,
+              },
+              {
+                onConflict: "owner_id,group_id,external_id",
+                ignoreDuplicates: true,
+              }
+            )
+            .select("id");
 
         if (insertError) throw insertError;
 
-        // Existing items are ignored, preventing duplicate alerts.
-        if (!insertedItems || insertedItems.length === 0) continue;
+        // Ignore existing posts to prevent duplicate alerts.
+        if (!insertedItems || insertedItems.length === 0) {
+          continue;
+        }
 
         const itemId = insertedItems[0].id;
 
@@ -306,8 +340,7 @@ Deno.serve(async (req: Request) => {
             owner_id: ownerId,
             detected_item_id: itemId,
             title: "تم العثور على منشور مطابق",
-            message:
-              `الكلمات المطابقة: ${matchedTerms.join("، ")}`,
+            message: `الكلمات المطابقة: ${matchedTerms.join("، ")}`,
             source_url: post.url,
             delivery_status: "pending",
           });
@@ -327,7 +360,10 @@ Deno.serve(async (req: Request) => {
             .eq("owner_id", ownerId);
 
           if (markError) {
-            console.error("Notification flag update failed:", markError.message);
+            console.error(
+              "Notification flag update failed:",
+              markError.message
+            );
           }
         }
       }
@@ -372,7 +408,9 @@ Deno.serve(async (req: Request) => {
 
     } catch (error) {
       const message =
-        error instanceof Error ? error.message : String(error);
+        error instanceof Error
+          ? error.message
+          : String(error);
 
       console.error("Monitoring job failed:", {
         job_id: jobId,
@@ -410,7 +448,10 @@ Deno.serve(async (req: Request) => {
     }
   }
 
-  const succeeded = results.filter((item) => item.success).length;
+  const succeeded = results.filter(
+    (item) => item.success
+  ).length;
+
   const failed = results.length - succeeded;
 
   return json({
@@ -421,3 +462,4 @@ Deno.serve(async (req: Request) => {
     results,
   });
 });
+             
