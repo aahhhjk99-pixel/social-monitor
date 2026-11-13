@@ -9,7 +9,7 @@ import {
   AlertCircle,
   Database,
   Radio,
-  CalendarClock
+  CalendarClock,
 } from "lucide-react";
 
 import { useAuth } from "../auth/AuthContext";
@@ -42,7 +42,6 @@ type FunctionResult = {
   message?: string;
   mode?: string;
   active_jobs?: number;
-  source_connected?: boolean;
   error?: string;
 };
 
@@ -57,7 +56,7 @@ function formatDate(value: string | null): string {
 
   return date.toLocaleString("ar-LY", {
     dateStyle: "medium",
-    timeStyle: "short"
+    timeStyle: "short",
   });
 }
 
@@ -109,8 +108,6 @@ export default function Monitoring() {
       return;
     }
 
-    setError("");
-
     const [jobsResult, runsResult] = await Promise.all([
       supabase
         .from("monitoring_jobs")
@@ -127,16 +124,11 @@ export default function Monitoring() {
         )
         .eq("owner_id", user.uid)
         .order("started_at", { ascending: false })
-        .limit(10)
+        .limit(10),
     ]);
 
-    if (jobsResult.error) {
-      throw jobsResult.error;
-    }
-
-    if (runsResult.error) {
-      throw runsResult.error;
-    }
+    if (jobsResult.error) throw jobsResult.error;
+    if (runsResult.error) throw runsResult.error;
 
     setJobs((jobsResult.data ?? []) as MonitoringJob[]);
     setRuns((runsResult.data ?? []) as MonitoringRun[]);
@@ -147,17 +139,14 @@ export default function Monitoring() {
 
     async function load() {
       setLoading(true);
+      setError("");
 
       try {
         await loadData();
       } catch (err) {
-        if (active) {
-          setError(errorMessage(err));
-        }
+        if (active) setError(errorMessage(err));
       } finally {
-        if (active) {
-          setLoading(false);
-        }
+        if (active) setLoading(false);
       }
     }
 
@@ -194,12 +183,10 @@ export default function Monitoring() {
     try {
       const { data, error: functionError } =
         await supabase.functions.invoke("monitor-groups", {
-          body: { action: "check" }
+          body: { action: "check" },
         });
 
-      if (functionError) {
-        throw functionError;
-      }
+      if (functionError) throw functionError;
 
       const result = data as FunctionResult;
 
@@ -207,7 +194,7 @@ export default function Monitoring() {
 
       if (result?.success) {
         setNotice(
-          "نجح الاتصال بوظيفة المراقبة وقاعدة البيانات."
+          "نجح اختبار الوظيفة المساعدة والاتصال بقاعدة البيانات."
         );
         await loadData();
       } else {
@@ -224,9 +211,7 @@ export default function Monitoring() {
     }
   }
 
-  const activeJobs = jobs.filter(
-    (job) => job.enabled
-  ).length;
+  const activeJobs = jobs.filter((job) => job.enabled).length;
 
   const successfulRuns = runs.filter(
     (run) => run.status === "success"
@@ -236,12 +221,8 @@ export default function Monitoring() {
     <div>
       <div className="page-heading">
         <div>
-          <span className="eyebrow">
-            مركز التحكم
-          </span>
-
+          <span className="eyebrow">مركز التحكم</span>
           <h1>المراقبة</h1>
-
           <p>
             متابعة مهام الفحص المجدولة وحالة الخدمات الخلفية.
           </p>
@@ -264,10 +245,7 @@ export default function Monitoring() {
       )}
 
       {notice && (
-        <div
-          className="notice warning"
-          role="status"
-        >
+        <div className="notice warning" role="status">
           <CheckCircle2 size={17} />
           {notice}
         </div>
@@ -312,7 +290,7 @@ export default function Monitoring() {
           <div>
             <h2>مصدر البيانات</h2>
             <p>
-              حالة الاتصال بمصدر المحتوى الخارجي.
+              إعداد ربط مصدر المنشورات الخارجي.
             </p>
           </div>
 
@@ -322,10 +300,11 @@ export default function Monitoring() {
         <div className="notice warning">
           <AlertCircle size={18} />
           <div>
-            <strong>مصدر فيسبوك غير مربوط</strong>
+            <strong>SocialAPIs</strong>
             <p>
-              الوظيفة متصلة بقاعدة البيانات، لكن جلب
-              منشورات وتعليقات المجموعات لم يُفعّل بعد.
+              تم إعداد وظيفة الربط بمصدر SocialAPIs.
+              التحقق النهائي من جلب المنشورات وحفظ النتائج
+              والإشعارات ما زال بانتظار الاختبار التشغيلي.
             </p>
           </div>
         </div>
@@ -340,12 +319,12 @@ export default function Monitoring() {
             {testing ? (
               <>
                 <RefreshCw size={16} />
-                جارٍ اختبار الاتصال...
+                جارٍ اختبار الوظيفة...
               </>
             ) : (
               <>
                 <Play size={16} />
-                اختبار اتصال الوظيفة
+                اختبار الوظيفة المساعدة
               </>
             )}
           </button>
@@ -363,10 +342,12 @@ export default function Monitoring() {
 
         {functionResult && (
           <div className="result-panel">
-            <strong>نتيجة الاختبار</strong>
+            <strong>نتيجة اختبار الوظيفة المساعدة</strong>
             <p>
-              {functionResult.message || "تم استلام رد من الوظيفة."}
+              {functionResult.message ||
+                "تم استلام رد من الوظيفة."}
             </p>
+
             <div className="result-details">
               <span>
                 المهام النشطة: {functionResult.active_jobs ?? 0}
@@ -374,13 +355,11 @@ export default function Monitoring() {
               <span>
                 وضع الوظيفة: {functionResult.mode || "غير محدد"}
               </span>
-              <span>
-                مصدر البيانات:{" "}
-                {functionResult.source_connected
-                  ? "متصل"
-                  : "غير متصل"}
-              </span>
             </div>
+
+            <small>
+              هذا الاختبار لا يؤكد وحده نجاح جلب المنشورات من SocialAPIs.
+            </small>
           </div>
         )}
       </section>
@@ -436,9 +415,7 @@ export default function Monitoring() {
                         ? jobStatus(job.last_status)
                         : "متوقفة"}
                     </td>
-                    <td>
-                      كل {job.interval_hours} ساعات
-                    </td>
+                    <td>كل {job.interval_hours} ساعات</td>
                     <td>{formatDate(job.last_run_at)}</td>
                     <td>{formatDate(job.next_run_at)}</td>
                   </tr>
@@ -471,7 +448,7 @@ export default function Monitoring() {
             <Clock size={26} />
             <b>لا توجد عمليات فحص مسجلة بعد</b>
             <p>
-              سيظهر سجل التشغيل هنا عند بدء تسجيل عمليات الفحص الفعلية.
+              سيظهر سجل التشغيل هنا عند بدء تسجيل عمليات الفحص.
             </p>
           </div>
         ) : (
@@ -505,4 +482,3 @@ export default function Monitoring() {
     </div>
   );
 }
-
